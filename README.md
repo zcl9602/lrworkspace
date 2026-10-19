@@ -53,7 +53,7 @@ rw run --workspace <UUID或名称> --force cluster -- bash scripts/run.sh
 
 ## 构建与文档
 
-发布程序运行时不需要 Rust/Python/Git。Windows 与 macOS 用户先按[跨平台安装](docs/portable-setup.md)执行 `rw doctor`、`rw mcp install --client codex`；安装采用用户版本目录、绝对路径和配置备份，并更新旧版 MCP 路径。内置 `rw proxy` 可直接提供 SOCKS5 转发，无需私人 Python 脚本。Windows 已实际测试；Mac 双架构提供 CI/验收脚本，尚未实机或远端 CI 验证。
+发布程序运行时不需要 Rust/Python/Git。Windows 与 macOS 用户先按[跨平台安装](docs/portable-setup.md)执行 `rw doctor`、`rw mcp install --client codex`；安装采用用户版本目录、绝对路径和配置备份，并更新旧版 MCP 路径。内置 `rw proxy` 可直接提供 SOCKS5 转发，无需私人 Python 脚本。Windows、Apple Silicon Mac 和 Intel Mac 已通过 GitHub 托管 runner 的完整测试与隔离安装验收；用户 Mac 到实际集群的连接仍需按自己的配置验证。
 
 ```text
 cargo test --workspace --locked

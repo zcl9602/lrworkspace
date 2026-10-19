@@ -2,7 +2,7 @@
 
 使用自己平台的完整压缩包，三个程序保留在同一目录。Windows 使用 x86_64；Apple Silicon 使用 macOS aarch64；Intel Mac 使用 macOS x86_64，Mac 构建的最低系统目标为 macOS 12。运行发布程序不需要 Rust、Python、Git 或 WSL。基本功能需要本机 OpenSSH 的 ssh/scp；远端仍面向有 Bash、GNU 工具和可选 Slurm/PBS 的 Linux。
 
-当前已在 Windows 实际验证。macOS 两种架构已配置 CI 与安装验收，尚未执行 Mac 实机或远端 CI，不能据此宣称已在 Mac 通过。
+Windows 已实际验证；Apple Silicon 和 Intel Mac 已通过 GitHub macOS runner 上的构建、完整测试、MCP 集成及隔离安装验收。尚未在用户自己的 Mac 上完成真实集群连接测试；CI 结果不替代其 SSH 配置与认证验收。
 
 ## 安装
 

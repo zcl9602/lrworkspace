@@ -27,7 +27,7 @@ cargo test -p lrworkspace-remote real_rsync_roundtrip --locked -- --ignored --no
 
 Windows 该测试使用原生 rsync 的本地模式校验二进制和特殊文件名往返；Unix 通过一个只启动本机 rsync server 子进程的 fake-SSH helper 覆盖协议传输。两者都不连接远端服务器。Windows 模拟 SSH 的原生/Cygwin 管道不等价于真实配套 SSH，不将该测试宣称为服务器联调。
 
-CI 配置在 Ubuntu、Windows、macOS Apple Silicon（macos-15）、macOS Intel（macos-15-intel）运行普通测试、显式 MCP 集成及隔离用户安装验收，并在 Ubuntu 显式运行 rsync 协议回归。release 工作流在三个用户目标平台构建并打包原生程序、来源提交与 SHA256；Windows MSVC 使用静态 CRT。本次维护不代表远端 CI 或 Mac 实机已执行。
+CI 配置在 Ubuntu、Windows、macOS Apple Silicon（macos-15）、macOS Intel（macos-15-intel）运行普通测试、显式 MCP 集成及隔离用户安装验收，并在 Ubuntu 显式运行 rsync 协议回归。release 工作流在三个用户目标平台构建并打包原生程序、来源提交与 SHA256；Windows MSVC 使用静态 CRT。具体结果以对应提交的 CI 为准；托管 runner 的验证不替代用户 Mac 到真实集群的连接验收。
 
 ```text
 cargo build -p lrworkspace-cli -p lrworkspace-mcp --locked

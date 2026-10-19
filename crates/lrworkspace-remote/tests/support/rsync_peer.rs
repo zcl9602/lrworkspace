@@ -10,21 +10,16 @@ fn main() {
         eprintln!("fake SSH requires rsync server mode"); std::process::exit(91);
     };
     let executable = std::env::var_os("LRW_TEST_RSYNC").expect("rsync path provided by local test");
-    use std::io::{Read, Write};
-    use std::process::Stdio;
-    let mut child = std::process::Command::new(executable).args(&args[server..])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
-    let mut input = child.stdin.take().unwrap();
-    std::thread::spawn(move || { let _ = std::io::copy(&mut std::io::stdin().lock(), &mut input); });
-    let mut output = child.stdout.take().unwrap();
-    let mut stdout = std::io::stdout().lock();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let count = output.read(&mut buffer).unwrap();
-        if count == 0 { break; }
-        stdout.write_all(&buffer[..count]).unwrap();
-        stdout.flush().unwrap();
+    // Preserve rsync's exact pipe/EOF semantics. A relay thread adds another
+    // buffering layer to its bidirectional protected-arguments handshake.
+    #[cfg(unix)] {
+        use std::os::unix::process::CommandExt;
+        let error=std::process::Command::new(executable).args(&args[server..]).exec();
+        eprintln!("local rsync server failed to start: {error}");
     }
-    let status = child.wait().unwrap();
-    std::process::exit(status.code().unwrap_or(92));
+    #[cfg(not(unix))] {
+        let _=(executable,server);
+        eprintln!("the fake SSH protocol peer is Unix-only; Windows tests local mode");
+    }
+    std::process::exit(92);
 }
