@@ -1,0 +1,33 @@
+[package]
+name = "lrworkspace-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+autobins = false
+
+[[bin]]
+name = "lrworkspace"
+path = "src/main.rs"
+
+[[bin]]
+name = "rw"
+path = "src/bin/rw.rs"
+
+[dependencies]
+lrworkspace-core = { path = "../lrworkspace-core" }
+lrworkspace-remote = { path = "../lrworkspace-remote" }
+lrworkspace-slurm = { path = "../lrworkspace-slurm" }
+lrworkspace-audit = { path = "../lrworkspace-audit" }
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+toml_edit = "0.22"
+chrono.workspace = true
+dialoguer = "0.11"
+uuid.workspace = true

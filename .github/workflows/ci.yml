@@ -1,0 +1,38 @@
+name: Rust tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build matching CLI and MCP
+        run: cargo build -p lrworkspace-cli -p lrworkspace-mcp --locked
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+      - name: Run MCP command-array integration
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_command_array --locked -- --ignored --nocapture
+      - name: Run MCP compute-node SSH integration
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_cluster_ssh --locked -- --ignored --nocapture
+      - name: Run MCP bounded-output session regression
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_truncated --locked -- --ignored --nocapture
+      - name: Test clean user installation and minimal PATH
+        run: cargo test -p lrworkspace-cli --test portable installing_from_unicode --locked -- --ignored --nocapture
+      - name: Check supplied Perl reference parity
+        run: cargo test -p lrworkspace-remote reference_perl --locked -- --ignored --nocapture
+      - name: Run local rsync protocol roundtrip
+        if: runner.os == 'Linux'
+        run: cargo test -p lrworkspace-remote real_rsync_roundtrip --locked -- --ignored --nocapture

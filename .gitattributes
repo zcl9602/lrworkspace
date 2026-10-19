@@ -1,0 +1,2 @@
+* text=auto eol=lf
+docs/reference/slurm_array_user.pl -text whitespace=cr-at-eol
