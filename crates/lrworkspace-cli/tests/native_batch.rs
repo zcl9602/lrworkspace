@@ -227,7 +227,12 @@ fn ssh_stdin_deadline_does_not_wait_for_a_nonreading_peer() {
     let script=format!("# {}\nprintf done","x".repeat(512*1024));let start=std::time::Instant::now();
     let mut child=f.command().env("LRW_TEST_BLOCK_STDIN","1").args(["run","--workspace","fixture","--force","direct","--timeout-secs","1","--","-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();let output=child.wait_with_output().unwrap();
-    assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("deadline"));assert!(start.elapsed()<std::time::Duration::from_secs(3));
+    let error=String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(),"stdout={}",String::from_utf8_lossy(&output.stdout));
+    // Both transports must report the typed timeout and return promptly;
+    // Unix process capture and Windows persistent SSH use different wording.
+    assert!(error.contains("Timeout:"),"{error}");
+    assert!(start.elapsed()<std::time::Duration::from_secs(3),"{error}");
 }
 
 #[test]

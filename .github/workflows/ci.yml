@@ -19,6 +19,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Fake SSH executes Linux-side scripts locally; macOS's BSD commands
+      # cannot simulate the GNU tools required on real Linux endpoints.
+      - name: Prepare Linux script test dependencies on macOS
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+        shell: bash
+        run: |
+          brew install coreutils gnu-tar
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
       - name: Build matching CLI and MCP
         run: cargo build -p lrworkspace-cli -p lrworkspace-mcp --locked
       - name: Run workspace tests

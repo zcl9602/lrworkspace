@@ -10,6 +10,15 @@ cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
 
 缓存完整可加 `--offline`。有相应组件时再运行 `cargo fmt --all -- --check` 和 `cargo clippy --workspace --all-targets --locked`；缺失组件不能视为通过。
 
+Mac 开发环境运行完整测试前，需要用 GNU 工具模拟 Linux endpoint。安装 `coreutils`、`gnu-tar`，并将它们的 `libexec/gnubin` 加到测试 PATH（CI 自动准备）：
+
+```sh
+brew install coreutils gnu-tar
+export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/libexec/gnubin:$PATH"
+```
+
+这是运行本机 fake-SSH/远端脚本测试的开发依赖；Mac 发布程序连接 Linux 服务器时仍使用服务器上的 GNU 工具，不要求本机安装这些包。超时回归同时检查 Timeout 错误类型和实际返回耗时，不依赖某个平台的报错措辞。
+
 真实 rsync 本地回归测试需要可运行的 rsync：
 
 ```text
