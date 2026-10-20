@@ -168,21 +168,37 @@ fn default_ssh_port() -> u16 {
     22
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum AuthMethod {
     /// SSH key file path.
     #[serde(rename = "key")]
     Key {
         path: PathBuf,
-        passphrase: Option<String>,
+        /// Legacy input is usable only in memory; never persisted again.
+        #[serde(default, skip_serializing)]
+        passphrase: Option<crate::privacy::SensitiveString>,
     },
     /// SSH agent forwarding.
     #[serde(rename = "agent")]
     Agent,
-    /// Password — NEVER persisted to disk. Only accepted from CLI flag
-    /// or env var LRWORKSPACE_SSH_PASSWORD during init, then discarded.
+    /// Legacy in-process library authentication. Never serialized or accepted
+    /// through MCP arguments; use LocalPassword for the native private flow.
     #[serde(rename = "password", skip_serializing)]
-    Password { password: String },
+    Password { password: crate::privacy::SensitiveString },
+    /// Opaque reference to process-local credentials; never contains a password.
+    #[serde(rename="local_password")]
+    LocalPassword { session_id: Uuid, #[serde(default,skip_serializing_if="Option::is_none")] socks_proxy: Option<String> },
+}
+
+impl std::fmt::Debug for AuthMethod {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        match self {
+            Self::Agent=>f.write_str("Agent"),
+            Self::Key{path,..}=>f.debug_struct("Key").field("path",path).field("passphrase",&crate::privacy::REDACTED).finish(),
+            Self::Password{..}=>f.write_str("Password([REDACTED])"),
+            Self::LocalPassword{session_id,..}=>f.debug_struct("LocalPassword").field("session_id",session_id).finish(),
+        }
+    }
 }
 
 /// An intermediate jump host.

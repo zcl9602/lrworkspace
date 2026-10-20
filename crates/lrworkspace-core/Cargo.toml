@@ -17,3 +17,4 @@ regex.workspace = true
 dirs.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+zeroize = "1.8"

@@ -19,6 +19,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          # Cache public dependencies only; build outputs can contain local paths.
+          path: ~/.cargo/registry
+          key: lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+            lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-
       # Fake SSH executes Linux-side scripts locally; macOS's BSD commands
       # cannot simulate the GNU tools required on real Linux endpoints.
       - name: Prepare Linux script test dependencies on macOS
@@ -32,6 +40,13 @@ jobs:
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
       - name: Build matching CLI and MCP
         run: cargo build -p lrworkspace-cli -p lrworkspace-mcp --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare synthetic SSH authentication test server
+        run: python -m pip install 'paramiko>=3.5,<5'
+      - name: Test artifact privacy gate and quoted build paths
+        run: python -m unittest discover -s scripts/tests -v
       - name: Run workspace tests
         run: cargo test --workspace --locked
       - name: Run MCP command-array integration
@@ -42,8 +57,20 @@ jobs:
         run: cargo test -p lrworkspace-cli --test native_batch mcp_truncated --locked -- --ignored --nocapture
       - name: Test clean user installation and minimal PATH
         run: cargo test -p lrworkspace-cli --test portable installing_from_unicode --locked -- --ignored --nocapture
+      - name: Verify native OpenSSH private password authentication
+        run: cargo test -p lrworkspace-cli --test password_native --locked -- --ignored --nocapture
       - name: Check supplied Perl reference parity
         run: cargo test -p lrworkspace-remote reference_perl --locked -- --ignored --nocapture
       - name: Run local rsync protocol roundtrip
         if: runner.os == 'Linux'
         run: cargo test -p lrworkspace-remote real_rsync_roundtrip --locked -- --ignored --nocapture
+      - name: Prepare isolated password-authentication fixture
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+      - name: Verify password SSH, SCP, rsync and logout on disposable localhost
+        if: runner.os == 'Linux'
+        env:
+          LRW_RUN_ISOLATED_SSHD_TEST: '1'
+        run: cargo test -p lrworkspace-cli --test private_login isolated_sshd --locked -- --ignored --nocapture

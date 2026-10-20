@@ -78,7 +78,7 @@ impl AuditLoggerImpl {
     fn append_record(path: &Path, record: &SerializableAuditRecord) -> CoreResult<()> {
         Self::ensure_dir(path)?;
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        let line = serde_json::to_string(record)?;
+        let line = serde_json::to_string(&lrworkspace_core::privacy::redacted_value(serde_json::to_value(record)?))?;
         writeln!(file, "{}", line)?;
         Ok(())
     }
@@ -121,7 +121,7 @@ impl AuditLoggerImpl {
 
 #[async_trait]
 impl AuditLogger for AuditLoggerImpl {
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     async fn record(
         &self,
         workspace_id: WorkspaceId,
@@ -137,8 +137,8 @@ impl AuditLogger for AuditLoggerImpl {
             agent: agent.clone(),
             operation: operation.to_string(),
             risk_level,
-            details: details.to_string(),
-            outcome: outcome.to_string(),
+            details: lrworkspace_core::privacy::redact_text(details),
+            outcome: lrworkspace_core::privacy::redact_text(outcome),
             timestamp: Utc::now(),
         };
 
@@ -267,6 +267,15 @@ impl From<SerializableAuditRecord> for AuditRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn known_credentials_are_removed_before_audit_persistence() {
+        let root=std::env::temp_dir().join(format!("lrw-audit-secret-{}",Uuid::new_v4()));
+        let password=lrworkspace_core::privacy::SensitiveString::new("audit-private-canary-5948".into());
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let logger=AuditLoggerImpl::new(&config);let id=Uuid::new_v4();
+        let record=logger.record(id,&AgentKind::CliAgent,"test",RiskLevel::ReadOnly,password.expose(),password.expose()).await.unwrap();
+        assert_eq!(record.details,"[REDACTED]");assert_eq!(record.outcome,"[REDACTED]");
+        assert!(!std::fs::read_to_string(logger.partition_path(id)).unwrap().contains(password.expose()));std::fs::remove_dir_all(root).unwrap();
+    }
 
 
     #[tokio::test]

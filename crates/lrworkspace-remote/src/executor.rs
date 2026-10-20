@@ -135,6 +135,7 @@ impl RemoteExecutorImpl {
         login_shell: bool,
         timeout: Duration,
     ) -> CoreResult<(i32, String, String, bool)> {
+        crate::local_auth::check_session(config)?;
         #[cfg(not(windows))]
         {
             exec_via_system_ssh(config, command, timeout, login_shell, self.max_output_bytes).await
@@ -199,6 +200,29 @@ impl RemoteExecutorImpl {
             timeout,
             #[cfg(windows)]
             windows_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Revoke a private login without deleting registration or remote files.
+    pub fn close_local_session(&self,id:Uuid) {
+        #[cfg(unix)]
+        let previous=crate::local_auth::session_connection(id).map(|config| {
+            let socket=crate::ssh_config::control_path_for_connection(&config);(config,socket)
+        });
+        crate::local_auth::remove_session(id);
+        #[cfg(windows)] {
+            let marker=format!(":local:{id}:");
+            self.windows_sessions.lock().unwrap_or_else(|e|e.into_inner()).retain(|key,session|{
+                if key.contains(&marker){
+                    // Never wait on an in-flight command's session mutex. It
+                    // owns an Arc until completion; dropping it then closes SSH.
+                    if let Ok(mut idle)=session.try_lock(){let _=idle.child.kill();}
+                    false
+                }else{true}
+            });
+        }
+        #[cfg(unix)] if let Some((config,socket))=previous {
+            let _=crate::process::capture(crate::openssh::ssh_command_for(&config).args(["-F","none","-O","exit","-o"]).arg(format!("ControlPath={}",socket.display())).arg(&config.host),Duration::from_secs(1),"close local session");
         }
     }
 
@@ -945,7 +969,7 @@ pub(crate) fn ensure_ssh_master(
     interactive: bool,
 ) -> CoreResult<()> {
     crate::ssh_config::prepare_control_directory(control_path)?;
-    if !interactive {
+    if !interactive||crate::local_auth::is_local_password(config) {
         // No TTY to prompt on — let the real command try with BatchMode so it
         // either reuses key/agent auth or fails fast with a clear error. We
         // skip the probe entirely so a slow/hung ssh cannot stall the caller.
@@ -954,18 +978,18 @@ pub(crate) fn ensure_ssh_master(
 
     // Already up? Cheap probe against the control socket (local, fast).
     let started=std::time::Instant::now();
-    let alive=crate::process::capture(crate::openssh::ssh_command()
+    let alive=crate::process::capture(crate::openssh::ssh_command_for(&config)
         .arg("-O").arg("check").arg("-o").arg(format!("ControlPath={}",control_path.display())).arg(&config.host),
         timeout.min(Duration::from_secs(2)),"SSH master probe").is_ok_and(|output|output.status.success());
     if alive {
         return Ok(());
     }
 
-    let mut cmd = crate::openssh::ssh_command();
+    let mut cmd = crate::openssh::ssh_command_for(&config);
     cmd.arg("-f")
         .arg("-N")
         .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
+        .arg(crate::local_auth::host_key_mode(&config))
         .arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)))
         .arg("-o")
@@ -1036,11 +1060,11 @@ impl WindowsSshSession {
     fn spawn(config: &ConnectionConfig, timeout: Duration) -> CoreResult<Self> {
         let resolved_user = config.user.clone();
         let resolved_port = config.port;
-        let mut command = crate::openssh::ssh_command();
+        let mut command = crate::openssh::ssh_command_for(&config);
         command
             .arg("-T")
             .arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
+            .arg(crate::local_auth::host_key_mode(&config))
             .arg("-o")
             .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)))
             .arg("-o")
@@ -1048,13 +1072,15 @@ impl WindowsSshSession {
             .arg("-o")
             .arg("ServerAliveCountMax=3")
             .arg("-o")
-            .arg("BatchMode=yes")
+            .arg(crate::local_auth::batch_mode(&config))
             .arg("-l")
             .arg(&resolved_user);
         command.arg("-p").arg(resolved_port.to_string());
         if let AuthMethod::Key { path, .. } = &config.auth {
             command.arg("-i").arg(path);
         }
+        command.args(crate::local_auth::ssh_arguments(config,false)?);
+        crate::local_auth::apply(config,&mut command,false)?;
         command
             .arg(&config.host)
             .arg("exec /bin/bash --noprofile --norc")
@@ -1259,7 +1285,7 @@ fn windows_session_key(config: &ConnectionConfig) -> String {
         AuthMethod::Key { path, .. } => path.to_string_lossy(),
         _ => std::borrow::Cow::Borrowed("agent"),
     };
-    format!("{}@{}:{port}:{identity}", user, config.host)
+    if let AuthMethod::LocalPassword{session_id,..}=&config.auth {format!("{}@{}:{port}:local:{session_id}:{}",user,config.host,crate::local_auth::control_tag(*session_id))}else{format!("{}@{}:{port}:{identity}", user, config.host)}
 }
 
 #[cfg(test)]
@@ -1306,9 +1332,9 @@ async fn exec_via_system_ssh(
             interactive,
         )?;
 
-        let mut cmd = crate::openssh::ssh_command();
+        let mut cmd = crate::openssh::ssh_command_for(&config);
         cmd.arg("-o")
-            .arg("StrictHostKeyChecking=accept-new")
+            .arg(crate::local_auth::host_key_mode(&config))
             .arg("-o")
             .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)));
         #[cfg(not(windows))]
@@ -1324,13 +1350,15 @@ async fn exec_via_system_ssh(
             .arg("ServerAliveCountMax=3")
             // MCP has no interactive prompt; key or agent auth must succeed.
             .arg("-o")
-            .arg("BatchMode=yes")
+            .arg(crate::local_auth::batch_mode(&config))
             .arg("-l")
             .arg(&resolved_user);
         cmd.arg("-p").arg(resolved_port.to_string());
         if let AuthMethod::Key { path, .. } = &config.auth {
             cmd.arg("-i").arg(path);
         }
+        cmd.args(crate::local_auth::ssh_arguments(&config,false)?);
+        crate::local_auth::apply(&config,&mut cmd,false)?;
         cmd.arg(&config.host);
 
         if login_shell {
@@ -1438,32 +1466,11 @@ fn authenticate_session(
 ) -> CoreResult<()> {
     match auth {
         AuthMethod::Agent => {
-            let agent_result = session.userauth_agent(username);
-            // Agent auth failed — try password from env var as fallback
-            if agent_result.is_err() || !session.authenticated() {
-                if let Ok(pw) = std::env::var("LRWORKSPACE_SSH_PASSWORD") {
-                    if !pw.is_empty() {
-                        tracing::info!(
-                            "Agent auth failed, falling back to LRWORKSPACE_SSH_PASSWORD"
-                        );
-                        session.userauth_password(username, &pw).map_err(|_| {
-                            CoreError::Connection(format!(
-                                "Password fallback auth failed for '{}'",
-                                username
-                            ))
-                        })?;
-                        return Ok(());
-                    }
-                }
-                // No env var — report the original agent error
-                agent_result.map_err(|e| {
-                    CoreError::Connection(format!("Agent auth for '{}': {}", username, e))
-                })?;
-            }
+            session.userauth_agent(username).map_err(|e|CoreError::Connection(format!("Agent auth for '{}': {}",username,e)))?;
         }
         AuthMethod::Key { path, passphrase } => {
             session
-                .userauth_pubkey_file(username, None, path, passphrase.as_deref())
+                .userauth_pubkey_file(username, None, path, passphrase.as_ref().map(|value|value.expose()))
                 .map_err(|e| {
                     CoreError::Connection(format!(
                         "Key auth for '{}' with {}: {}",
@@ -1474,10 +1481,11 @@ fn authenticate_session(
                 })?;
         }
         AuthMethod::Password { password } => {
-            session.userauth_password(username, password).map_err(|_| {
+            session.userauth_password(username, password.expose()).map_err(|_| {
                 CoreError::Connection(format!("Password auth failed for '{}'", username))
             })?;
         }
+        AuthMethod::LocalPassword{..}=>return Err(CoreError::PermissionDenied("Private password sessions require native OpenSSH".into())),
     }
 
     if !session.authenticated() {

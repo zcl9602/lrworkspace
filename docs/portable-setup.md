@@ -1,4 +1,4 @@
-# Windows / macOS 安装与环境检查（0.4.0）
+# Windows / macOS 安装与环境检查（0.5.1）
 
 使用自己平台的完整压缩包，三个程序保留在同一目录。Windows 使用 x86_64；Apple Silicon 使用 macOS aarch64；Intel Mac 使用 macOS x86_64，Mac 构建的最低系统目标为 macOS 12。运行发布程序不需要 Rust、Python、Git 或 WSL。基本功能需要本机 OpenSSH 的 ssh/scp；远端仍面向有 Bash、GNU 工具和可选 Slurm/PBS 的 Linux。
 
@@ -30,6 +30,8 @@ Codex 使用 `$CODEX_HOME/config.toml`（未设时为用户 `.codex/config.toml`
 
 ## 每个用户配置自己的 SSH
 
+0.5.1 也支持桌面 MCP 的[本机私密密码登录](private-login.md)：不需要 SSH config，调用 `workspace_login` 后在独立窗口填写，不把密码发送给模型。Windows 使用内置 Windows PowerShell / WinForms，macOS 使用系统 Cocoa / osascript；无额外 Python 运行时依赖。该路径忽略 SSH config，使用独立 known_hosts，密码会话不跨客户端或重启保存。以下配置适用于密钥 / SSH agent 用户。
+
 以下账户、主机、节点、地址和路径均为虚构示例，需替换成自己的设置。
 
 先保证自己的系统 SSH 能用密钥或 agent 非交互登录。LRW 使用各自系统的 SSH 配置、known_hosts 与认证，不分发任何人的注册、密钥或代理脚本。注册时省略端口/用户会用 `ssh -G` 解析 Include、Match 和 Host；显式参数优先。
@@ -48,7 +50,7 @@ Host my-cluster
     HostName 192.0.2.20
     Port 2222
     User alice
-    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.4.0-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
+    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.5.1-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
 ```
 
 Mac 将程序位置替换为安装输出的绝对路径（没有 `.exe`）。代理地址/端口使用自己的设置；没有代理就省略 ProxyCommand。内置转发只支持无需用户名/密码的 SOCKS5；其它认证代理沿用合适的 ProxyCommand。代理只向 stdout 转发二进制，诊断走 stderr，握手默认 10 秒，可用 `--connect-timeout` 改。

@@ -41,14 +41,59 @@ use lrworkspace_core::config::LrWorkspaceConfig;
 use lrworkspace_core::types::AgentKind;
 use lrworkspace_mcp::McpServer;
 
+fn main() {
+    lrworkspace_core::privacy::install_panic_redaction();
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    if arguments == ["--version"] {
+        println!("lrworkspace-mcp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if arguments == ["--help"] {
+        println!("lrworkspace-mcp [--stdio | --version]\nDefault transport: stdio JSON-RPC");
+        return;
+    }
+    if arguments == ["--private-submit"] {
+        let success = lrworkspace_remote::local_auth::submit_private_form().is_ok();
+        if success {
+            println!("submitted");
+        }
+        std::process::exit(if success { 0 } else { 1 });
+    }
+    if arguments.len() == 4 && arguments[0] == "--auth-proxy" {
+        let result = arguments[3]
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or(())
+            .and_then(|port| {
+                lrworkspace_remote::proxy::relay_stdio(
+                    &arguments[1],
+                    &arguments[2],
+                    port,
+                    std::time::Duration::from_secs(10),
+                )
+                .map_err(|_| ())
+            });
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    if std::env::var_os("LRW_ASKPASS_ENDPOINT").is_some()
+        && arguments.len() == 1
+        && !arguments[0].starts_with("--")
+    {
+        let success = lrworkspace_remote::local_auth::askpass(&arguments[0]).unwrap_or(false);
+        std::process::exit(if success { 0 } else { 1 });
+    }
+    if !arguments.is_empty() && arguments != ["--stdio"] {
+        eprintln!("Unknown MCP arguments; use --stdio or no arguments");
+        std::process::exit(2);
+    }
+    run_server();
+}
+
 #[tokio::main]
-async fn main() {
-    let arguments:Vec<_>=std::env::args().skip(1).collect();
-    if arguments==["--version"] {println!("lrworkspace-mcp {}",env!("CARGO_PKG_VERSION"));return;}
-    if arguments==["--help"] {println!("lrworkspace-mcp [--stdio | --version]\nDefault transport: stdio JSON-RPC");return;}
-    if !arguments.is_empty() && arguments!=["--stdio"] {eprintln!("Unknown MCP arguments; use --stdio or no arguments");std::process::exit(2);}
+async fn run_server() {
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr) // stderr so stdout stays clean for JSON-RPC
+        .with_writer(lrworkspace_core::privacy::RedactingStderr::default)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),

@@ -9,6 +9,7 @@ pub mod config;
 pub mod jsonl;
 pub mod error;
 pub mod permission;
+pub mod privacy;
 pub mod safety;
 pub mod traits;
 pub mod types;

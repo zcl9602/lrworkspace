@@ -9,6 +9,9 @@ import shutil
 import subprocess
 import tarfile
 import zipfile
+import re
+
+from release_privacy import PrivacyError, assert_clean, private_roots
 
 
 def main():
@@ -19,9 +22,15 @@ def main():
     parser.add_argument("--arch", choices=["x86_64", "aarch64"], required=True)
     parser.add_argument("--source-commit", required=True)
     args = parser.parse_args()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", args.source_commit):
+        raise SystemExit("source-commit must be a full Git SHA")
     repository = Path(__file__).resolve().parents[1]
     suffix = ".exe" if args.platform == "windows" else ""
     binary_dir = args.bin_dir.resolve()
+    roots=private_roots(repository,binary_dir.parent)
+    # Fail before copying files or creating an archive. Do not publish a dirty
+    # binary just because its source tree was sanitized.
+    assert_clean([binary_dir/(name+suffix) for name in ("rw","lrworkspace","lrworkspace-mcp")],roots)
     versions = []
     for name in ("rw", "lrworkspace-mcp"):
         line = subprocess.check_output([str(binary_dir / (name + suffix)), "--version"], text=True).strip()
@@ -39,6 +48,7 @@ def main():
     for document in documents:
         destination = package / document
         destination.parent.mkdir(parents=True, exist_ok=True)
+        assert_clean([repository/document],roots,binary=False)
         shutil.copy2(repository / document, destination)
     files = {str(p.relative_to(package)).replace(os.sep, "/"): hashlib.sha256(p.read_bytes()).hexdigest()
              for p in sorted(package.rglob("*")) if p.is_file()}
@@ -63,4 +73,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except PrivacyError as error:
+        raise SystemExit(str(error)) from None

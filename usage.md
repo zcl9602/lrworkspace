@@ -6,7 +6,7 @@
 
 ```text
 cargo test --workspace --locked
-cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
+python scripts/build_release.py --verify-install
 ```
 
 产物默认在 `target/release/`，Windows 使用 `.exe` 后缀。以下示例假定 `rw` 已在 PATH；否则使用完整路径。`rw` 与 `lrworkspace` 是相同实现。
@@ -16,6 +16,8 @@ cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
 安装前备份配置，并更新已有 lrworkspace 的旧程序路径，保留其他服务、自定义环境变量和更长超时。默认 Codex 工具预算至少 150 秒，为 120 秒操作预留余量；如果单次请求使用更长超时，客户端的 tool timeout 也需大于该预算，例如 300 秒操作可将客户端设为 330 秒。更换程序后重新连接 MCP。
 
 ## 2. 注册与选择远程工作区
+
+没有 SSH config、希望使用密码时，在桌面 MCP 中调用 `workspace_login`，由用户完成独立本机窗口；再调用 `workspace_login_status` 查询结果。密码禁止作为工具参数或聊天内容传入。重新连接 MCP 后，用 `workspace_login {workspace_id: ...}` 重新认证；该会话不能由独立 CLI 进程复用。详见[本机私密登录](docs/private-login.md)。以下 CLI 注册方式适用于已有 SSH config / 密钥 / agent。
 
 ```powershell
 rw init `

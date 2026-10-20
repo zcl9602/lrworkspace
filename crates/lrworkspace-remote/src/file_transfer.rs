@@ -96,7 +96,7 @@ fn apply_openssh_options(
     #[cfg(not(windows))]
     crate::ssh_config::prepare_control_directory(&target.control_path)?;
     cmd.arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
+        .arg(crate::local_auth::host_key_mode(config))
         .arg("-o")
         .arg(format!("ConnectTimeout={}", timeout.as_secs().max(1)));
     #[cfg(not(windows))]
@@ -111,10 +111,12 @@ fn apply_openssh_options(
         .arg("-o")
         .arg("ServerAliveCountMax=3")
         .arg("-o")
-        .arg("BatchMode=yes");
+        .arg(crate::local_auth::batch_mode(config));
     if let AuthMethod::Key { path, .. } = &config.auth {
         cmd.arg("-i").arg(path);
     }
+    cmd.args(crate::local_auth::ssh_arguments(config,false)?);
+    crate::local_auth::apply(config,cmd,false)?;
     Ok(())
 }
 
@@ -177,7 +179,7 @@ fn try_system_scp_download(
     }
 
     let remote_spec = scp_remote_spec(&target, &remote_abs)?;
-    let mut cmd = crate::openssh::scp_command();
+    let mut cmd = crate::openssh::scp_command_for(&config);
     apply_openssh_options(&mut cmd, &config, &target, timeout)?;
     append_port_flag(&mut cmd, &target, true);
     cmd.arg(&remote_spec).arg(&local_tmp);
@@ -194,7 +196,7 @@ fn try_system_scp_download(
 
 fn try_system_scp_upload(config: &ConnectionConfig, remote_abs: &Path, local_path: &Path, timeout: Duration) -> CoreResult<()> {
     let target = resolve_openssh_target(config);
-    let mut command = crate::openssh::scp_command();
+    let mut command = crate::openssh::scp_command_for(&config);
     apply_openssh_options(&mut command, config, &target, timeout)?;
     append_port_flag(&mut command, &target, true);
     command.arg("--").arg(local_path).arg(scp_remote_spec(&target, remote_abs)?);
@@ -309,7 +311,8 @@ fn rsync_command(config: &ConnectionConfig, remote: &Path, local: &Path, timeout
     }
     command.current_dir(parent).args(["-tzs", "--blocking-io", "--partial", "--checksum", "--no-perms", "--no-owner", "--no-group"])
         .arg(format!("--timeout={}", timeout.as_secs().max(1)))
-        .arg("-e").arg(rsync_ssh_command(config, &target, timeout)).arg("--");
+        .arg("-e").arg(rsync_ssh_command(config, &target, timeout)?).arg("--");
+    crate::local_auth::apply(config,&mut command,rsync_ssh_program().1)?;
     let local_operand = Path::new(".").join(name);
     let remote_operand = rsync_remote_spec(&target, &remote);
     if upload { command.arg(local_operand).arg(remote_operand); }
@@ -321,19 +324,21 @@ fn rsync_ssh_command(
     config: &ConnectionConfig,
     target: &OpenSshTarget,
     timeout: Duration,
-) -> String {
+) -> CoreResult<String> {
     let (ssh, cygwin) = rsync_ssh_program();
-    let config_path=std::env::var_os("LRWORKSPACE_SSH_CONFIG").map(PathBuf::from).or_else(|| {
+    let config_path=if crate::local_auth::is_local_password(config){None}else{std::env::var_os("LRWORKSPACE_SSH_CONFIG").map(PathBuf::from).or_else(|| {
         if cygwin {std::env::var_os("USERPROFILE").map(|home|PathBuf::from(home).join(".ssh/config")).filter(|p|p.is_file())}else{None}
-    });
-    rsync_ssh_command_with_config(config,target,timeout,ssh,cygwin,config_path.as_deref())
+    })};
+    let mut command=rsync_ssh_command_with_config(config,target,timeout,ssh,cygwin,config_path.as_deref());
+    for argument in crate::local_auth::ssh_arguments(config,cygwin)? {command.push(' ');command.push_str(&rsync_quote(&argument));}
+    Ok(command)
 }
 
 fn rsync_ssh_command_with_config(config:&ConnectionConfig,target:&OpenSshTarget,timeout:Duration,ssh:String,cygwin:bool,config_path:Option<&Path>)->String {
     let mut parts = vec![
         ssh,
         "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
+        crate::local_auth::host_key_mode(config).into(),
         "-o".into(),
         format!("ConnectTimeout={}", timeout.as_secs().max(1)),
         "-o".into(),
@@ -341,7 +346,7 @@ fn rsync_ssh_command_with_config(config:&ConnectionConfig,target:&OpenSshTarget,
         "-o".into(),
         "ServerAliveCountMax=3".into(),
         "-o".into(),
-        "BatchMode=yes".into(),
+        crate::local_auth::batch_mode(config).into(),
         "-l".into(),
         target.user.clone(),
     ];

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 authors = ["LrWorkspaceRemote Team"]
@@ -32,3 +32,7 @@ ssh2 = "0.9"
 openssl = { version = "0.10", features = ["vendored"] }
 async-trait = "0.1"
 regex = "1"
+
+[profile.release]
+debug = 0
+strip = "symbols"
