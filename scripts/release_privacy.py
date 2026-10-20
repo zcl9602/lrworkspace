@@ -46,6 +46,18 @@ CREDENTIALS = [
     re.compile(rb"(?:sk-(?:proj-|ant-api\d+-)?[A-Za-z0-9_-]{24,}|hf_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{20,})"),
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----[\s\r\n]+[A-Za-z0-9+/=\r\n]{40,}"),
 ]
+PUBLIC_KEY_ALGORITHMS = [b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"]
+
+
+def credential_material(data):
+    for pattern in CREDENTIALS:
+        for match in pattern.finditer(data):
+            # An OpenSSH security-key algorithm is public protocol metadata,
+            # not an API secret that happens to share the sk- prefix.
+            if any(data[match.start():match.start()+len(name)] == name for name in PUBLIC_KEY_ALGORITHMS):
+                continue
+            return True
+    return False
 
 
 def inspect_artifact(path, roots=(), *, binary=True):
@@ -55,9 +67,18 @@ def inspect_artifact(path, roots=(), *, binary=True):
         return ["empty artifact"]
     findings = set()
     with path.open("rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as data:
-        for pattern in CREDENTIALS:
-            if pattern.search(data):
-                findings.add("credential-shaped material")
+        if credential_material(data):
+            findings.add("credential-shaped material")
+        for pattern, offset in [(rb"(?:[\x09\x0a\x0d\x20-\x7e]\x00){12,}", 0),
+                                (rb"(?:\x00[\x09\x0a\x0d\x20-\x7e]){12,}", 1)]:
+            for match in re.finditer(pattern, data):
+                for start in range(match.start(), match.end(), 65536):
+                    # Bounded windows overlap to catch split tokens/paths.
+                    plain = data[start:min(start+73728, match.end())][offset::2]
+                    if credential_material(plain):
+                        findings.add("credential-shaped material")
+                    if binary and any(item.search(plain) for item in PROFILE_PATHS):
+                        findings.add("unmapped user profile path")
         if binary and any(pattern.search(data) for pattern in PROFILE_PATHS):
             findings.add("unmapped user profile path")
         for root in roots:

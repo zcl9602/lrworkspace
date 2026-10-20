@@ -11,7 +11,7 @@ import tarfile
 import zipfile
 import re
 
-from release_privacy import assert_clean, private_roots
+from release_privacy import PrivacyError, assert_clean, private_roots
 
 
 def main():
@@ -73,4 +73,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except PrivacyError as error:
+        raise SystemExit(str(error)) from None

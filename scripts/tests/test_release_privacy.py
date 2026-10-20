@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_release import build_environment
 from release_privacy import PrivacyError, assert_clean, inspect_artifact
+from native_compiler import private_arguments
 
 
 class ReleasePrivacyTests(unittest.TestCase):
@@ -29,15 +30,29 @@ class ReleasePrivacyTests(unittest.TestCase):
                    b"ghp_" + b"a1B2c3D4" * 5,
                    b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + b"A" * 64 + b"\n"]
         for sample in samples:
-            with tempfile.TemporaryDirectory() as directory:
-                file = Path(directory) / "fixture.bin"; file.write_bytes(sample)
-                self.assertTrue(inspect_artifact(file))
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                with tempfile.TemporaryDirectory() as directory:
+                    file = Path(directory) / "fixture.bin"; file.write_bytes(sample.decode().encode(encoding))
+                    self.assertTrue(inspect_artifact(file))
 
     def test_anonymous_paths_and_nonfunctional_ui_fixture_are_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             file = Path(directory) / "fixture.bin"
             file.write_bytes(b"/lrw-build/2/registry/src/dependency.rs\x00ui-validation-only\x00192.0.2.1")
             assert_clean([file], ["C:/Users/Example Account"])
+            file.write_bytes(b"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com")
+            assert_clean([file])
+
+    def test_native_flags_do_not_leak_through_openssl_build_information(self):
+        with tempfile.TemporaryDirectory(prefix="lrw build ") as directory:
+            root=Path(directory)
+            env, _=build_environment(root,root/"target","x86_64-unknown-linux-gnu",{})
+            self.assertRegex(env["CC"],r"^lrw-[0-9a-f]{8}-cc$")
+            self.assertNotIn(str(root),env.get("CFLAGS",""))
+            args=private_arguments(['-DENGINESDIR="/private/output/lib/engines-3"','-DMODULESDIR="/private/output/lib/ossl-modules"','-DKEEP=1','-c','input.c'],['-ffile-prefix-map=/private/output=/anonymous'],['/private/output'])
+            self.assertIn('-DENGINESDIR="/usr/local/lib/engines-3"',args)
+            self.assertIn('-DMODULESDIR="/usr/local/lib/ossl-modules"',args)
+            self.assertIn('-DKEEP=1',args)
 
     def test_flags_preserve_static_runtime_and_spaces(self):
         with tempfile.TemporaryDirectory(prefix="lrw build ") as directory:
