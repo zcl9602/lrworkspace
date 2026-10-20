@@ -40,6 +40,9 @@ def serve(connection):
             channel.send_exit_status(0)
             channel.shutdown_write()
             channel.close()
+            # Let OpenSSH consume channel-close and send its disconnect before
+            # closing TCP. Abrupt teardown races Linux's final disconnect send.
+            transport.join(timeout=5)
     except Exception:
         pass
     finally:
