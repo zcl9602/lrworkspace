@@ -28,22 +28,35 @@ jobs:
           - os: macos-15-intel
             platform: macos
             arch: x86_64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x86_64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git/db
+            target-private
+          key: private-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: private-release-${{ runner.os }}-${{ runner.arch }}-
       - name: Use static Windows C runtime
         if: runner.os == 'Windows'
         shell: pwsh
         run: Add-Content -Path $env:GITHUB_ENV -Value 'RUSTFLAGS=-C target-feature=+crt-static'
-      - name: Build matching native executables
-        run: cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
-      - name: Test release installation in an isolated user profile
-        run: cargo test --release --locked -p lrworkspace-cli --test portable -- --include-ignored --nocapture
+      - name: Prepare synthetic authentication test dependency
+        run: python -m pip install 'paramiko>=3.5,<5'
+      - name: Test artifact privacy gate
+        run: python -m unittest discover -s scripts/tests -v
+      - name: Build with private paths, verify release installation and native authentication
+        run: python scripts/build_release.py --target-dir target-private --verify-install --verify-password
       - name: Package with source revision and SHA256 manifest
-        run: python scripts/package_release.py --bin-dir target/release --out-dir dist --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --source-commit ${{ github.sha }}
+        run: python scripts/package_release.py --bin-dir target-private/release --out-dir dist --platform ${{ matrix.platform }} --arch ${{ matrix.arch }} --source-commit ${{ github.sha }}
       - uses: actions/upload-artifact@v4
         with:
           name: lrworkspace-${{ matrix.platform }}-${{ matrix.arch }}

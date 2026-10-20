@@ -174,7 +174,9 @@ pub enum AuthMethod {
     #[serde(rename = "key")]
     Key {
         path: PathBuf,
-        passphrase: Option<String>,
+        /// Legacy input is usable only in memory; never persisted again.
+        #[serde(default, skip_serializing)]
+        passphrase: Option<crate::privacy::SensitiveString>,
     },
     /// SSH agent forwarding.
     #[serde(rename = "agent")]
@@ -182,7 +184,7 @@ pub enum AuthMethod {
     /// Legacy in-process library authentication. Never serialized or accepted
     /// through MCP arguments; use LocalPassword for the native private flow.
     #[serde(rename = "password", skip_serializing)]
-    Password { password: String },
+    Password { password: crate::privacy::SensitiveString },
     /// Opaque reference to process-local credentials; never contains a password.
     #[serde(rename="local_password")]
     LocalPassword { session_id: Uuid, #[serde(default,skip_serializing_if="Option::is_none")] socks_proxy: Option<String> },

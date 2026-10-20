@@ -6,7 +6,7 @@
 
 ```text
 cargo test --workspace --locked
-cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
+python scripts/build_release.py --verify-install
 ```
 
 产物默认在 `target/release/`，Windows 使用 `.exe` 后缀。以下示例假定 `rw` 已在 PATH；否则使用完整路径。`rw` 与 `lrworkspace` 是相同实现。

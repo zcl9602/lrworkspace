@@ -1466,32 +1466,11 @@ fn authenticate_session(
 ) -> CoreResult<()> {
     match auth {
         AuthMethod::Agent => {
-            let agent_result = session.userauth_agent(username);
-            // Agent auth failed — try password from env var as fallback
-            if agent_result.is_err() || !session.authenticated() {
-                if let Ok(pw) = std::env::var("LRWORKSPACE_SSH_PASSWORD") {
-                    if !pw.is_empty() {
-                        tracing::info!(
-                            "Agent auth failed, falling back to LRWORKSPACE_SSH_PASSWORD"
-                        );
-                        session.userauth_password(username, &pw).map_err(|_| {
-                            CoreError::Connection(format!(
-                                "Password fallback auth failed for '{}'",
-                                username
-                            ))
-                        })?;
-                        return Ok(());
-                    }
-                }
-                // No env var — report the original agent error
-                agent_result.map_err(|e| {
-                    CoreError::Connection(format!("Agent auth for '{}': {}", username, e))
-                })?;
-            }
+            session.userauth_agent(username).map_err(|e|CoreError::Connection(format!("Agent auth for '{}': {}",username,e)))?;
         }
         AuthMethod::Key { path, passphrase } => {
             session
-                .userauth_pubkey_file(username, None, path, passphrase.as_deref())
+                .userauth_pubkey_file(username, None, path, passphrase.as_ref().map(|value|value.expose()))
                 .map_err(|e| {
                     CoreError::Connection(format!(
                         "Key auth for '{}' with {}: {}",
@@ -1502,7 +1481,7 @@ fn authenticate_session(
                 })?;
         }
         AuthMethod::Password { password } => {
-            session.userauth_password(username, password).map_err(|_| {
+            session.userauth_password(username, password.expose()).map_err(|_| {
                 CoreError::Connection(format!("Password auth failed for '{}'", username))
             })?;
         }

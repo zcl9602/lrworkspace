@@ -1,6 +1,6 @@
 # Local Remote Workspace（LRW）
 
-LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.5.0**。
+LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.5.1**。
 
 ```text
 agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data 根
@@ -10,6 +10,8 @@ agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data �
 不需要本地 LRW 项目目录、marker、项目镜像或同步。agent 在自己的项目中完成编辑，使用 `rw write --from` 或 MCP 的 `local_path` 上传；LRW 只保存连接注册、缓存和审计，传输临时文件自动清理。
 
 没有 SSH config 时，Windows / macOS 的 MCP 可调用 `workspace_login`，由用户在本机独立窗口填写 IP、端口、用户名和密码。密码不进入聊天、MCP 参数或持久化配置；工具只返回登录状态。Windows 可在系统保护可用时显示明文预览，macOS 保持遮蔽。会话在重启后失效；详情及保护边界见[本机私密登录](docs/private-login.md)。
+
+0.5.1 修复发布二进制中的个人构建路径和旧私钥口令的明文保存：统一映射 Rust/C 路径、剥离符号，并在打包前检查程序；注册和新建备份不再保存私钥口令。旧字段只作本次进程内兼容，后续使用 SSH agent。详见[隐私修复与验收](docs/release-privacy.md)。
 
 ## 执行方式
 
@@ -59,7 +61,7 @@ rw run --workspace <UUID或名称> --force cluster -- bash scripts/run.sh
 
 ```text
 cargo test --workspace --locked
-cargo build --release --locked -p lrworkspace-cli -p lrworkspace-mcp
+python scripts/build_release.py --verify-install
 ```
 
 Windows 产物为原生 `.exe`；Linux/macOS 使用同一数据模型。运行时不依赖 WSL，远端不需要安装 LRW。依赖缓存完整时可加 `--offline`。

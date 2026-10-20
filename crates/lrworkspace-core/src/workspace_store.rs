@@ -56,7 +56,10 @@ pub fn update_connection_port(config:&LrWorkspaceConfig,workspace:&mut Workspace
     use std::io::Write;
     if port==0{return Err(CoreError::Validation("SSH port must be 1-65535".into()));}
     if workspace.connection.port==port{return Ok(None);}
-    let source=workspace_path(config,workspace.id);let bytes=std::fs::read(&source)?;
+    // Snapshot the stored definition through its credential-safe serializer.
+    // A raw byte backup would replicate legacy plaintext key passphrases.
+    let previous=load_workspace(config,workspace.id)?;
+    let bytes=serde_json::to_vec_pretty(&previous)?;
     let directory=config.data_dir.join("registration-backups");std::fs::create_dir_all(&directory)?;
     let backup=directory.join(format!("{}.{}.json",workspace.id,Uuid::new_v4()));
     let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
@@ -73,7 +76,9 @@ fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> CoreResult<(
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
     let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
     let result = (|| -> CoreResult<()> {
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        let mut options=std::fs::OpenOptions::new();options.write(true).create_new(true);
+        #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
+        let mut file=options.open(&temporary)?;
         file.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
         file.sync_all()?;
         drop(file);
@@ -96,6 +101,14 @@ pub fn load_workspace(config: &LrWorkspaceConfig, id: WorkspaceId) -> CoreResult
         CoreError::Config(format!("Invalid workspace registration {id} at {}: {error}", path.display()))
     })?;
     validate_definition(&workspace)?;
+    // Keep redaction active if an error/output outlives the loaded workspace.
+    let retain=|auth:&AuthMethod|->CoreResult<()> {
+        let secret=match auth {AuthMethod::Key{passphrase,..}=>passphrase.as_ref(),AuthMethod::Password{password}=>Some(password),_=>None};
+        if secret.is_some_and(|value|!value.is_empty()&&!value.retain_for_redaction()) {return Err(CoreError::InvalidState("Credential redaction capacity reached; restart LRW".into()));}
+        Ok(())
+    };
+    retain(&workspace.connection.auth)?;
+    for jump in &workspace.connection.jump_hosts{retain(&jump.auth)?;}
     Ok(workspace)
 }
 
@@ -228,6 +241,51 @@ pub fn load_job_record(config:&LrWorkspaceConfig, workspace:WorkspaceId, job_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_key_passphrases_are_memory_only_and_never_replicated_into_backups() {
+        let root=std::env::temp_dir().join(format!("lrw-credential-store-{}",Uuid::new_v4()));
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};
+        let mut record=serde_json::to_value(workspace()).unwrap();
+        let id=Uuid::parse_str(record["id"].as_str().unwrap()).unwrap();
+        let first="legacy-key-canary-5729";let second="legacy-jump-canary-8913";
+        record["connection"]["auth"]=serde_json::json!({"key":{"path":"/fixture/key","passphrase":first}});
+        record["connection"]["jump_hosts"]=serde_json::json!([{"host":"192.0.2.2","port":22,"user":"fixture","auth":{"key":{"path":"/fixture/jump-key","passphrase":second}}}]);
+        std::fs::create_dir_all(workspaces_dir(&config)).unwrap();
+        std::fs::write(workspace_path(&config,id),serde_json::to_vec(&record).unwrap()).unwrap();
+        let mut loaded=load_workspace(&config,id).unwrap();
+        let AuthMethod::Key{passphrase:Some(secret),..}=&loaded.connection.auth else{panic!("legacy input must remain usable in memory")};
+        assert_eq!(secret.expose(),first);
+        let backup=update_connection_port(&config,&mut loaded,2222).unwrap().unwrap();
+        for path in [workspace_path(&config,id),backup] {
+            let text=std::fs::read_to_string(&path).unwrap();assert!(!text.contains(first));assert!(!text.contains(second));
+            let value:serde_json::Value=serde_json::from_str(&text).unwrap();
+            assert!(value["connection"]["auth"]["key"].get("passphrase").is_none());
+            assert!(value["connection"]["jump_hosts"][0]["auth"]["key"].get("passphrase").is_none());
+            assert_eq!(value["remote_work_dir"],record["remote_work_dir"]);
+            #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(std::fs::metadata(path).unwrap().permissions().mode()&0o777,0o600);}
+        }
+        assert_eq!(load_workspace(&config,id).unwrap().connection.port,2222);
+        drop(loaded);assert_eq!(crate::privacy::redact_text(first),crate::privacy::REDACTED);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn persisted_legacy_passwords_cannot_be_resaved_or_copied() {
+        let root=std::env::temp_dir().join(format!("lrw-legacy-password-{}",Uuid::new_v4()));
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};
+        let mut record=serde_json::to_value(workspace()).unwrap();let id=Uuid::parse_str(record["id"].as_str().unwrap()).unwrap();
+        record["connection"]["auth"]=serde_json::json!({"password":{"password":"legacy-password-canary-1926"}});
+        std::fs::create_dir_all(workspaces_dir(&config)).unwrap();let original=serde_json::to_vec(&record).unwrap();
+        std::fs::write(workspace_path(&config,id),&original).unwrap();let mut loaded=load_workspace(&config,id).unwrap();
+        assert!(save_workspace(&config,&loaded).is_err());assert!(update_connection_port(&config,&mut loaded,2222).is_err());
+        assert_eq!(std::fs::read(workspace_path(&config,id)).unwrap(),original);
+        assert!(!config.data_dir.join("registration-backups").exists());
+        // Explicit re-login/agent migration can replace the old record safely.
+        loaded.connection.auth=AuthMethod::Agent;save_workspace(&config,&loaded).unwrap();
+        assert!(!std::fs::read_to_string(workspace_path(&config,id)).unwrap().contains("legacy-password-canary-1926"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn array_job_records_are_workspace_scoped_and_path_safe() {

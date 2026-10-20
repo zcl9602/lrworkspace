@@ -26,7 +26,9 @@ jobs:
             ~/.cargo/git/db
             target
           key: lrw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
-          restore-keys: lrw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+          restore-keys: |
+            lrw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+            lrw-${{ runner.os }}-${{ runner.arch }}-
       # Fake SSH executes Linux-side scripts locally; macOS's BSD commands
       # cannot simulate the GNU tools required on real Linux endpoints.
       - name: Prepare Linux script test dependencies on macOS
@@ -45,6 +47,8 @@ jobs:
           python-version: '3.12'
       - name: Prepare synthetic SSH authentication test server
         run: python -m pip install 'paramiko>=3.5,<5'
+      - name: Test artifact privacy gate and quoted build paths
+        run: python -m unittest discover -s scripts/tests -v
       - name: Run workspace tests
         run: cargo test --workspace --locked
       - name: Run MCP command-array integration
