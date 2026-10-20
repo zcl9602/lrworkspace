@@ -111,8 +111,6 @@ fn isolated_sshd_password_authentication_and_binary_transports() {
                 "useradd",
                 "--no-create-home",
                 "--no-log-init",
-                "-K",
-                "CREATE_MAIL_SPOOL=no",
                 "--shell",
                 "/bin/sh",
                 "--home-dir",

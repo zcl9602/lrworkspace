@@ -77,11 +77,16 @@ fn native_openssh_password_is_delivered_only_to_the_private_authentication_pipe(
         ),
     )
     .unwrap();
-    let helper = Path::new(env!("CARGO_BIN_EXE_rw"))
+    let source_helper = Path::new(env!("CARGO_BIN_EXE_rw"))
         .parent()
         .unwrap()
         .join(format!("lrworkspace-mcp{}", std::env::consts::EXE_SUFFIX));
-    assert!(helper.is_file());
+    assert!(source_helper.is_file());
+    // Real installations may contain Unicode and spaces in the user path.
+    let helper_dir = root.join("helper 中文 space");
+    fs::create_dir(&helper_dir).unwrap();
+    let helper = helper_dir.join(source_helper.file_name().unwrap());
+    fs::copy(&source_helper, &helper).unwrap();
     if local_auth::ui_available() {
         local_auth::validate_native_dialog_for_helper(&helper).unwrap();
     }

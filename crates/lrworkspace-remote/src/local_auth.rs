@@ -98,11 +98,11 @@ pub fn create_session_at(
     target: SessionTarget,
 ) -> CoreResult<()> {
     if password.is_empty()
-        || password.expose().len() > 1024
+        || password.expose().len() > 1023
         || password.expose().contains(['\r', '\n', '\0'])
     {
         return Err(CoreError::Validation(
-            "Enter a nonempty single-line password of at most 1024 UTF-8 bytes in the local window"
+            "Enter a nonempty single-line password of at most 1023 UTF-8 bytes in the local window"
                 .into(),
         ));
     }
@@ -315,8 +315,35 @@ pub fn apply(config: &ConnectionConfig, command: &mut Command, cygwin: bool) -> 
         return Ok(());
     };
     let service = broker()?;
+    let helper = helper_path(&session.helper, cygwin);
+    #[cfg(windows)]
+    let helper = if !cygwin {
+        if helper.is_ascii() {
+            format!("\"{helper}\"")
+        } else {
+            // Native OpenSSH's ANSI environment can corrupt a Unicode helper
+            // path. Inherit the UTF-16 cwd and pass an ASCII relative name.
+            let parent = session.helper.parent().ok_or_else(required_login)?;
+            if command.get_current_dir().is_some_and(|dir| dir != parent) {
+                return Err(CoreError::Validation(
+                    "Use Cygwin rsync or SCP for private login from a Unicode Windows installation"
+                        .into(),
+                ));
+            }
+            let filename = session
+                .helper
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| name.is_ascii())
+                .ok_or_else(required_login)?;
+            command.current_dir(parent);
+            format!("\"./{filename}\"")
+        }
+    } else {
+        helper
+    };
     command
-        .env("SSH_ASKPASS", helper_path(&session.helper, cygwin))
+        .env("SSH_ASKPASS", helper)
         .env("SSH_ASKPASS_REQUIRE", "force")
         .env("LRW_ASKPASS_ENDPOINT", service.address.to_string())
         .env("LRW_ASKPASS_CAPABILITY", session.capability.expose())

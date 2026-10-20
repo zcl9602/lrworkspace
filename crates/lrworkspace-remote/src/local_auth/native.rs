@@ -74,10 +74,10 @@ impl LoginInput {
             || self.user.is_empty()
             || self.user.len() > 128
             || self.user.starts_with('-')
-            || self
+            || !self
                 .user
-                .chars()
-                .any(|c| c.is_control() || c.is_whitespace())
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
         {
             return Err(CoreError::Validation(
                 "Enter a valid SSH user and port in the local window".into(),
@@ -97,7 +97,7 @@ impl LoginInput {
             validate_proxy(&self.socks_proxy)?;
         }
         if self.password.is_empty()
-            || self.password.expose().len() > 1024
+            || self.password.expose().len() > 1023
             || self.password.expose().contains(['\r', '\n', '\0'])
         {
             return Err(CoreError::Validation(
@@ -437,6 +437,27 @@ pub(super) fn submit_form() -> CoreResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn connection_fields_cannot_reinterpret_transport_operands() {
+        let mut form = serde_json::json!({"host":"192.0.2.1","port":2222,"user":"fixture_01","name":"fixture","remote_work_dir":"/work","node_mode":"submit_only","authorized":true,"password":"validation-canary-8431"});
+        assert!(serde_json::from_value::<LoginInput>(form.clone())
+            .unwrap()
+            .validate()
+            .is_ok());
+        for user in ["-option", "user@other-host", "user:other/path", "user name"] {
+            form["user"] = serde_json::json!(user);
+            assert!(serde_json::from_value::<LoginInput>(form.clone())
+                .unwrap()
+                .validate()
+                .is_err());
+        }
+        form["user"] = serde_json::json!("fixture");
+        form["password"] = serde_json::json!("x".repeat(1024));
+        assert!(serde_json::from_value::<LoginInput>(form)
+            .unwrap()
+            .validate()
+            .is_err());
+    }
     #[test]
     fn callback_rejects_browser_origin_and_wrong_capability() {
         let channel = UiChannel::new().unwrap();

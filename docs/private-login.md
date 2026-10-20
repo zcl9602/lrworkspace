@@ -24,7 +24,7 @@ workspace_logout {workspace_id: ...}     # 撤销当前 MCP 进程的密码会�
 
 OpenSSH 使用 `SSH_ASKPASS_REQUIRE=force`，另一个受随机能力令牌和证书固定保护的本机 TLS 通道只向其私有 askpass 管道提供密码。密码不进入命令行、环境变量、临时文件或 MCP 标准输出；子进程环境中的能力令牌也不会返回给 agent。使用本机 OpenSSH，运行时无 Python、额外密码工具或自建 SSH 服务器依赖。
 
-会话绑定主机、端口、用户名及代理。该登录路径使用 `-F none`，不会执行用户 SSH config 中的 Match/ProxyCommand；主机密钥保存在 LRW 数据目录的 `private-auth/known_hosts`。SOCKS5 仅支持数字 IP:port、无需认证的代理。支持原生 SSH、SCP 及兼容的 rsync；Windows Cygwin rsync 仍需配套 SSH/shell，失败遵循已有显式传输规则。
+会话绑定主机、端口、用户名及代理。该登录路径使用 `-F none`，不会执行用户 SSH config 中的 Match/ProxyCommand；主机密钥保存在 LRW 数据目录的 `private-auth/known_hosts`。用户名接受字母、数字、点、下划线和连字符，密码最多 1023 UTF-8 字节，避免 OpenSSH askpass 截断。SOCKS5 仅支持数字 IP:port、无需认证的代理。支持原生 SSH、SCP 及兼容的 rsync；Windows Cygwin rsync 仍需配套 SSH/shell，失败遵循已有显式传输规则。Windows 非 ASCII 安装路径通过助手目录与相对程序名绕过原生 OpenSSH 环境变量的编码差异；如果原生 rsync 需要保留不同工作目录，则使用配套 Cygwin SSH 或 SCP，不能改动上传源目录。
 
 ## 会话与边界
 
