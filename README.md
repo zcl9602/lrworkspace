@@ -1,6 +1,6 @@
 # Local Remote Workspace（LRW）
 
-LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.4.0**。
+LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.5.0**。
 
 ```text
 agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data 根
@@ -8,6 +8,8 @@ agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data �
 ```
 
 不需要本地 LRW 项目目录、marker、项目镜像或同步。agent 在自己的项目中完成编辑，使用 `rw write --from` 或 MCP 的 `local_path` 上传；LRW 只保存连接注册、缓存和审计，传输临时文件自动清理。
+
+没有 SSH config 时，Windows / macOS 的 MCP 可调用 `workspace_login`，由用户在本机独立窗口填写 IP、端口、用户名和密码。密码不进入聊天、MCP 参数或持久化配置；工具只返回登录状态。Windows 可在系统保护可用时显示明文预览，macOS 保持遮蔽。会话在重启后失效；详情及保护边界见[本机私密登录](docs/private-login.md)。
 
 ## 执行方式
 

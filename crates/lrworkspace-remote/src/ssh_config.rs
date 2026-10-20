@@ -268,7 +268,9 @@ pub(crate) fn prepare_control_directory(socket:&std::path::Path)->lrworkspace_co
 
 /// ControlPath using the same user/port resolution as [`exec_via_system_ssh`].
 pub fn control_path_for_connection(config: &lrworkspace_core::types::ConnectionConfig) -> PathBuf {
-    control_path(&config.host, &config.user, config.port)
+    if let lrworkspace_core::AuthMethod::LocalPassword{session_id,..}=&config.auth {
+        control_path(&format!("{}:local:{session_id}:{}",config.host,crate::local_auth::control_tag(*session_id)),&config.user,config.port)
+    }else{control_path(&config.host, &config.user, config.port)}
 }
 
 fn resolve_path(path: &str) -> PathBuf {

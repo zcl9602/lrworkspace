@@ -23,6 +23,12 @@ pub fn ssh_program()->OsString {resolve("ssh","LRWORKSPACE_SSH")}
 pub fn scp_program()->OsString {resolve("scp","LRWORKSPACE_SCP")}
 pub fn ssh_command()->std::process::Command {let mut command=std::process::Command::new(ssh_program());apply_config(&mut command);command}
 pub fn scp_command()->std::process::Command {let mut command=std::process::Command::new(scp_program());apply_config(&mut command);command}
+pub fn ssh_command_for(config:&lrworkspace_core::ConnectionConfig)->std::process::Command {
+    if crate::local_auth::is_local_password(config){let mut command=std::process::Command::new(ssh_program());command.args(["-F","none"]);command}else{ssh_command()}
+}
+pub fn scp_command_for(config:&lrworkspace_core::ConnectionConfig)->std::process::Command {
+    if crate::local_auth::is_local_password(config){let mut command=std::process::Command::new(scp_program());command.args(["-F","none"]);command}else{scp_command()}
+}
 fn apply_config(command:&mut std::process::Command) {if let Some(path)=std::env::var_os("LRWORKSPACE_SSH_CONFIG"){command.arg("-F").arg(path);}}
 fn available(program:OsString)->bool {Path::new(&program).is_file() || find_on_path(&program.to_string_lossy()).is_some()}
 pub fn openssh_client_available()->bool {available(ssh_program())&&available(scp_program())}

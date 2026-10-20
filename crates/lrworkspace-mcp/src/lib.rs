@@ -35,6 +35,7 @@ use lrworkspace_remote::batch::{BatchOptions,BatchCommand,read_command_file,pars
 use regex::Regex;
 use std::fs;
 use std::sync::LazyLock;
+mod local_login;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -92,7 +93,7 @@ struct InitializeResult {
 
 const MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const AGENT_INSTRUCTIONS: &str =
-    "Call workspace_discover first. Cluster submits unless user names an SSH compute node. Never delete user files or ask to sync.";
+    "workspace_discover first. Cluster submits unless user names compute node. No delete/sync. Passwords: local workspace_login only.";
 
 fn batch_options(args:&serde_json::Map<String,Value>)->CoreResult<BatchOptions> {
     match args.get("batch") {None=>Ok(BatchOptions::default()),Some(Value::Object(value))=>Ok(serde_json::from_value(Value::Object(value.clone()))?),_=>Err(CoreError::Validation("batch must be an object".into()))}
@@ -235,7 +236,7 @@ fn write_journal(config: &LrWorkspaceConfig, workspace_id: Uuid, entry: Value) -
     }
     let mut file = fs::OpenOptions::new().create(true).append(true).open(path)?;
     use std::io::Write;
-    writeln!(file, "{}", serde_json::to_string(&entry)?)?;
+    writeln!(file, "{}", serde_json::to_string(&lrworkspace_core::privacy::redacted_value(entry))?)?;
     Ok(())
 }
 
@@ -249,7 +250,10 @@ pub struct McpServer {
     config: LrWorkspaceConfig,
     agent: std::sync::Mutex<AgentKind>,
     client_supports_elicitation: bool,
+    local_logins: local_login::LocalLogins,
 }
+
+impl Drop for McpServer {fn drop(&mut self){self.local_logins.shutdown();}}
 
 impl McpServer {
     pub fn new(config: LrWorkspaceConfig, agent: AgentKind) -> CoreResult<Self> {
@@ -262,6 +266,7 @@ impl McpServer {
             slurm: Arc::new(SlurmManagerImpl::new(executor.clone())),
             pbs: Arc::new(PbsManagerImpl::new(executor.clone())),
             audit: Arc::new(AuditLoggerImpl::new(&config)),
+            local_logins: local_login::LocalLogins::new(config.clone(),executor.clone()),
             executor,
             config,
             agent: std::sync::Mutex::new(agent),
@@ -304,7 +309,10 @@ impl McpServer {
                 },
             };
             let mut stdout = io::stdout().lock();
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            // Preserve protocol constants and caller-generated request IDs.
+            let mut wire=serde_json::to_value(&response)?;
+            for field in ["result","error"] {if let Some(value)=wire.get_mut(field){lrworkspace_core::privacy::redact_value(value);}}
+            writeln!(stdout, "{}", serde_json::to_string(&wire)?)?;
             stdout.flush()?;
         }
         Ok(())
@@ -387,7 +395,7 @@ impl McpServer {
                 serde_json::json!({
                     "content": [{
                         "type": "text",
-                        "text": serde_json::to_string_pretty(&value).unwrap_or_else(|error| error.to_string())
+                        "text": serde_json::to_string_pretty(&lrworkspace_core::privacy::redacted_value(value)).unwrap_or_else(|error| error.to_string())
                     }]
                 }),
             ),
@@ -405,6 +413,19 @@ impl McpServer {
         name: &str,
         args: &serde_json::Map<String, Value>,
     ) -> CoreResult<Value> {
+        if args.keys().any(|key|matches!(key.to_ascii_lowercase().as_str(),"password"|"passphrase"|"ssh_password")) {
+            return Err(CoreError::Validation("Passwords are not accepted in MCP arguments. Use workspace_login and the separate local window.".into()));
+        }
+        if name=="workspace_login" {
+            if args.keys().any(|key|key!="workspace_id"){return Err(CoreError::Validation("workspace_login accepts only an optional workspace_id; enter connection details in the local window".into()));}
+            let existing=if args.contains_key("workspace_id"){Some(resolve_workspace(&self.config,args)?)}else{None};
+            return self.local_logins.start(existing);
+        }
+        if name=="workspace_login_status" {
+            let id=Uuid::parse_str(required_string(args,"request_id")?).map_err(|_|CoreError::Validation("Invalid local login request ID".into()))?;
+            return self.local_logins.status(id);
+        }
+        if name=="workspace_logout" {let workspace=resolve_workspace(&self.config,args)?;return Ok(self.local_logins.logout(&workspace));}
         if name == "workspace_discover" {
             return self.discover(args).await;
         }
@@ -1112,6 +1133,7 @@ impl McpServer {
                     "remote_work_dir": workspace.remote_work_dir,
                     "remote_data_dirs": workspace.remote_data_dirs,
                     "node_execution_mode": workspace.node_execution_mode,
+                    "authentication_ready": lrworkspace_remote::local_auth::connection_ready(&workspace.connection),
                 })
             })
             .collect();
@@ -1122,7 +1144,7 @@ impl McpServer {
             "local_data_dir": self.config.data_dir,
             "elicitation_supported": self.client_supports_elicitation,
             "workspaces": values,
-            "next_action": if values.is_empty() { "Call workspace_configure; missing fields can be collected with an MCP form" } else { "Call workspace_layout, then workspace_env/index/read/write/run; call workspace_add_data_dir whenever another data root is needed" },
+            "next_action": if values.is_empty() { "Use workspace_login for private local password entry, or workspace_configure for key/agent authentication. Never request passwords in chat." } else { "If authentication_ready is false, call workspace_login with workspace_id. Otherwise call workspace_layout, then workspace_env/index/read/write/run." },
         }))
     }
 
@@ -1417,6 +1439,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     });
     vec![
         tool("workspace_discover", "List registered remote workspaces and their work/data roots.", serde_json::json!({}), &[]),
+        tool("workspace_login","Open a separate native local login window for IP/port/user/password without SSH config. Never send passwords in chat or tool arguments; do not inspect, screenshot or automate credential entry. Returns a request ID immediately; poll workspace_login_status. Credentials stay in this MCP process and require re-login after restart. Optional workspace_id re-authenticates an existing workspace without changing its endpoint.",serde_json::json!({"workspace_id":{"type":"string"}}),&[]),
+        tool("workspace_login_status","Read local login progress and authentication result; contains no password or form values.",serde_json::json!({"request_id":{"type":"string"}}),&["request_id"]),
+        tool("workspace_logout","Revoke this MCP process's local password session. Keeps registration and remote files; submitted jobs and in-flight operations may continue. Password redaction filters remain in memory until process exit.",serde_json::json!({"workspace_id":{"type":"string"}}),&[]),
         tool("workspace_doctor","Check local SSH/SCP/optional rsync and this computer's OpenSSH configuration. Does not contact servers or read private keys. With workspace_id, reports stale port mismatches without changing them.",serde_json::json!({"workspace_id":{"type":"string"}}),&[]),
         tool("workspace_update_connection","Explicitly repair a registered SSH port after the user confirms the endpoint. Default previews; confirmed:true backs up the original registration before updating. Does not change SSH config or cancel jobs.",serde_json::json!({"workspace_id":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"confirmed":{"type":"boolean","default":false}}),&["port"]),
         tool("workspace_configure", "Configure a workspace. Call without arguments to request a client form when elicitation is supported; No local project directory is required; data roots may be added later. A saved node mode is reused for the same host/user/port.", serde_json::json!({"host": {"type": "string"}, "user": {"type": "string"}, "port": {"type": "integer", "minimum":1,"maximum":65535,"description":"Optional; omit to inherit this computer's OpenSSH config"}, "remote_work_dir": {"type": "string"}, "remote_data_dirs": {"type": "string", "description": "Newline- or comma-separated remote POSIX paths"}, "name": {"type": "string"}, "node_execution_mode": {"type": "string", "enum": ["submit_only", "single_server", "direct_compute"]}, "node_mode_confirmed": {"type": "boolean", "default": false}, "authorize": {"type": "boolean", "default": false}}), &[]),
@@ -1450,14 +1475,12 @@ fn tool_definitions() -> Vec<ToolDefinition> {
 }
 
 fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> ToolDefinition {
+    let mut input_schema=serde_json::json!({"type":"object","properties":properties,"required":required});
+    if matches!(name,"workspace_login"|"workspace_login_status"|"workspace_logout"){input_schema["additionalProperties"]=Value::Bool(false);}
     ToolDefinition {
         name: name.into(),
         description: description.into(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": required
-        }),
+        input_schema,
     }
 }
 
@@ -1562,7 +1585,7 @@ fn success(request: &JsonRpcRequest, value: Value) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
         id: request.id.clone(),
-        result: Some(value),
+        result: Some(lrworkspace_core::privacy::redacted_value(value)),
         error: None,
     }
 }
@@ -1574,7 +1597,7 @@ fn failure(request: &JsonRpcRequest, code: i32, message: impl Into<String>) -> J
         result: None,
         error: Some(JsonRpcError {
             code,
-            message: message.into(),
+            message: lrworkspace_core::privacy::redact_text(&message.into()),
             data: None,
         }),
     }
@@ -1589,7 +1612,7 @@ fn tool_rpc_error(error: &CoreError) -> JsonRpcError {
     };
     JsonRpcError {
         code,
-        message: error.to_string(),
+        message: lrworkspace_core::privacy::redact_text(&error.to_string()),
         data: None,
     }
 }
@@ -1597,6 +1620,27 @@ fn tool_rpc_error(error: &CoreError) -> JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn passwords_are_rejected_as_tool_arguments_without_echo_or_persistence() {
+        let root=std::env::temp_dir().join(format!("lrw-no-secret-args-{}",Uuid::new_v4()));
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let mut server=McpServer::new(config,AgentKind::CliAgent).unwrap();
+        let request:JsonRpcRequest=serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_login","arguments":{"password":"unregistered-input-canary-8357"}}})).unwrap();
+        let response=server.handle_request(&request).await;let wire=serde_json::to_string(&response).unwrap();assert!(!wire.contains("unregistered-input-canary"));assert!(response.error.is_some());
+        assert!(!root.exists()||std::fs::read_dir(&root).unwrap().next().is_none());
+        for name in ["workspace_login","workspace_login_status","workspace_logout"] {
+            let tool=tool_definitions().into_iter().find(|tool|tool.name==name).unwrap();assert_eq!(tool.input_schema["additionalProperties"],false);assert!(tool.input_schema["properties"].get("password").is_none());
+        }
+        let _=std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn model_payloads_errors_and_diagnostic_journals_suppress_known_credentials() {
+        let secret=lrworkspace_core::privacy::SensitiveString::new("model-output-canary-3451".into());
+        let request:JsonRpcRequest=serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"})).unwrap();
+        let response=success(&request,serde_json::json!({"stdout":secret.expose(),"exit_code":0}));let wire=serde_json::to_string(&response).unwrap();assert!(!wire.contains(secret.expose()));assert!(wire.contains("REDACTED"));
+        let error=tool_rpc_error(&CoreError::Connection(secret.expose().into()));assert!(!error.message.contains(secret.expose()));
+        let root=std::env::temp_dir().join(format!("lrw-private-journal-{}",Uuid::new_v4()));let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let id=Uuid::new_v4();
+        write_journal(&config,id,serde_json::json!({"text":secret.expose()})).unwrap();assert!(!std::fs::read_to_string(journal_path(&config,id)).unwrap().contains(secret.expose()));std::fs::remove_dir_all(root).unwrap();
+    }
 
 
     #[test]

@@ -21,6 +21,9 @@ pub fn environment_report(config:&LrWorkspaceConfig,workspace:Option<&Workspace>
     let scp_available=Path::new(&scp).is_file()||crate::openssh::find_on_path(&scp.to_string_lossy()).is_some();
     let mut warnings=Vec::new();
     let connection=workspace.map(|ws| {
+        if crate::local_auth::is_local_password(&ws.connection) {
+            return json!({"workspace_id":ws.id,"host":ws.connection.host,"user":ws.connection.user,"registered_port":ws.connection.port,"ssh_config_used":false,"port_mismatch":false,"auth_mode":"local_password","authentication_ready":crate::local_auth::connection_ready(&ws.connection)});
+        }
         match crate::SshConfig::effective(&ws.connection.host,Some(&ws.connection.user),None) {
             Ok(effective)=> {
                 let mismatch=effective.port!=Some(ws.connection.port);

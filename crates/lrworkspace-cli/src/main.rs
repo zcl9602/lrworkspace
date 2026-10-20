@@ -344,10 +344,11 @@ impl App {
 
 #[tokio::main]
 async fn main() {
+    lrworkspace_core::privacy::install_panic_redaction();
     let code = match run().await {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("Error: {error}");
+            eprintln!("Error: {}",lrworkspace_core::privacy::redact_text(&error.to_string()));
             1
         }
     };
@@ -362,7 +363,7 @@ async fn run() -> CoreResult<i32> {
     }
     tracing_subscriber::fmt()
         .with_env_filter(if cli.verbose { "debug" } else { "warn" })
-        .with_writer(std::io::stderr)
+        .with_writer(lrworkspace_core::privacy::RedactingStderr::default)
         .init();
     let mut config =
         LrWorkspaceConfig::load_with_overrides(cli.config.as_deref(), cli.data_dir.as_deref())?;

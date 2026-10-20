@@ -37,6 +37,7 @@ mod indexer;
 pub mod openssh;
 pub mod proxy;
 pub mod doctor;
+pub mod local_auth;
 pub mod ssh_config;
 pub mod task_router;
 

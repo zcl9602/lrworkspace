@@ -62,7 +62,7 @@ pub(crate) fn capture_input(command:&mut Command, input:&[u8], timeout:Duration,
             let stderr=child.stderr.take().expect("piped stderr");
             let mut out_buffer=OutputBuffer::new(limit);let mut err_buffer=OutputBuffer::new(limit);
             let result=tokio::time::timeout_at(deadline, async {
-                tokio::try_join!(async {stdin.write_all(input).await?;stdin.shutdown().await},drain(stdout,&mut out_buffer),drain(stderr,&mut err_buffer),child.wait())
+                tokio::try_join!(async move {stdin.write_all(input).await?;stdin.shutdown().await?;drop(stdin);Ok::<_,std::io::Error>(())},drain(stdout,&mut out_buffer),drain(stderr,&mut err_buffer),child.wait())
             }).await;
             let (stdout,out_cut)=out_buffer.into_bytes();let (stderr,err_cut)=err_buffer.into_bytes();
             match result {
@@ -124,6 +124,13 @@ impl Drop for WindowsJob {fn drop(&mut self){unsafe {windows_sys::Win32::Foundat
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_is_closed_before_waiting_for_a_child_that_reads_to_eof() {
+        #[cfg(windows)] let mut command={let mut c=Command::new("powershell");c.args(["-NoProfile","-Command","$text=[Console]::In.ReadToEnd(); [Console]::Out.Write($text+'-eof')"]);c};
+        #[cfg(unix)] let mut command={let mut c=Command::new("sh");c.args(["-c","cat; printf -- '-eof'"]);c};
+        let (output,_)=capture_input(&mut command,b"private-input",Duration::from_secs(10),1024,"EOF test").unwrap();
+        assert!(output.status.success());assert_eq!(output.stdout,b"private-input-eof");
+    }
     fn shell(script: &str) -> Command {
         #[cfg(windows)]
         { let mut cmd = Command::new("cmd"); cmd.args(["/C", script]); cmd }

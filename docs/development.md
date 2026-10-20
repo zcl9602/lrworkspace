@@ -38,6 +38,8 @@ portable 测试使用全新中文/空格用户目录、独立 CODEX_HOME、旧�
 
 ## 回归契约
 
+0.5.0 的普通测试覆盖本机 UI 控件、证书固定、能力令牌与端点绑定、状态/注册/审计/日志脱敏和注销。CI 四个平台另用 Paramiko 合成 localhost 服务验证实际 OpenSSH 正确/错误密码；Windows/macOS 验证原生窗口到 Rust helper 的私有表单交接。Python/Paramiko 仅是测试依赖，安装包不需要它们。Ubuntu 还显式启动一次性 sshd/临时系统账户验证密码模式的 SCP、rsync 二进制上传、未知主机拒绝和注销；此测试须设置 `LRW_RUN_ISOLATED_SSHD_TEST=1`，仅可在可丢弃 runner/container 执行。原生控件自检不代替人工 GUI 操作或用户真实集群认证验收。
+
 - cluster 默认数组提交；只有显式 compute-node 目标可走第二跳 SSH，失败不回落/重提。旧 --force compute-node 仍是 cluster 别名。
 - CLI/MCP 共用节点模式决策，不按命令文本猜测计算地点。
 - 无本地项目目录/marker/cwd 绑定，旧字段可读取但不创建旧目录。
