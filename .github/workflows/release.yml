@@ -39,12 +39,10 @@ jobs:
           python-version: '3.12'
       - uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git/db
-            target-private
-          key: private-release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
-          restore-keys: private-release-${{ runner.os }}-${{ runner.arch }}-
+          # Cache public dependencies only; build outputs can contain local paths.
+          path: ~/.cargo/registry
+          key: release-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: release-registry-v1-${{ runner.os }}-${{ runner.arch }}-
       - name: Use static Windows C runtime
         if: runner.os == 'Windows'
         shell: pwsh

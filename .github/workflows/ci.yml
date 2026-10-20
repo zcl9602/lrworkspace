@@ -21,14 +21,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git/db
-            target
-          key: lrw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          # Cache public dependencies only; build outputs can contain local paths.
+          path: ~/.cargo/registry
+          key: lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            lrw-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
-            lrw-${{ runner.os }}-${{ runner.arch }}-
+            lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+            lrw-registry-v1-${{ runner.os }}-${{ runner.arch }}-
       # Fake SSH executes Linux-side scripts locally; macOS's BSD commands
       # cannot simulate the GNU tools required on real Linux endpoints.
       - name: Prepare Linux script test dependencies on macOS
