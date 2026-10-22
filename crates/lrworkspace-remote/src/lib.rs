@@ -40,6 +40,7 @@ pub mod doctor;
 pub mod local_auth;
 pub mod ssh_config;
 pub mod task_router;
+pub mod tasks;
 
 pub use cluster::ClusterDetectorImpl;
 pub use executor::RemoteExecutorImpl;

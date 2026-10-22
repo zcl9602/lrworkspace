@@ -184,15 +184,28 @@ enum Commands {
             clap::builder::PossibleValue::new("read-only"), clap::builder::PossibleValue::new("compute-node").hide(true),
         ]))]
         force: Option<String>,
-        /// Explicit permission to SSH from the login host to this compute node.
+        /// Optional compute hostname; omitted selects an idle node automatically.
         #[arg(long)]
         compute_node: Option<String>,
+        /// Auto-select an idle compute node, require SSH, or explicitly submit.
+        #[arg(long, default_value="auto", value_parser=["auto","ssh","submit"])]
+        execution_path: String,
+        /// Start an independent task and return its task ID immediately.
+        #[arg(long)]
+        background: bool,
         #[arg(long)]
         working_dir: Option<PathBuf>,
         #[command(flatten)]
         batch: BatchArgs,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// List independent tasks, or query one task's live status/log tails.
+    Tasks {
+        #[arg(long)] workspace: Option<String>,
+        #[arg(long)] task_id: Option<uuid::Uuid>,
+        #[arg(long)] logs: bool,
+        #[arg(long, default_value_t=16384, value_parser=clap::value_parser!(u32).range(1..=65536))] max_bytes: u32,
     },
     /// Generate a shuffled Slurm/PBS command array; --submit launches it.
     Submit {
@@ -342,7 +355,7 @@ impl App {
     }
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() {
     lrworkspace_core::privacy::install_panic_redaction();
     let code = match run().await {
@@ -604,6 +617,8 @@ async fn run() -> CoreResult<i32> {
             workspace,
             force,
             compute_node,
+            execution_path,
+            background,
             working_dir,
             batch,
             command,
@@ -648,6 +663,9 @@ async fn run() -> CoreResult<i32> {
                 force.as_deref(),
                 compute_node.as_deref(),
                 &options,
+                batch.configured(),
+                &execution_path,
+                background,
             )
             .await?;
             let audit_command = command.chars().take(500).collect::<String>();
@@ -664,6 +682,16 @@ async fn run() -> CoreResult<i32> {
             if let Err(error)=audit {value["audit_warning"]=serde_json::json!(format!("Operation completed, but audit recording failed: {error}; do not blindly replay"));}
             println!("{}", serde_json::to_string_pretty(&value)?);
             return Ok(run_exit_code(&value));
+        }
+        Commands::Tasks {workspace,task_id,logs,max_bytes}=> {
+            let workspace=app.workspace(workspace.as_deref())?;
+            let value=if let Some(id)=task_id {
+                lrworkspace_remote::tasks::poll(&app.executor,&app.config,&workspace,id,logs.then_some(max_bytes as usize)).await?
+            } else {
+                if logs {return Err(CoreError::Validation("--logs requires --task-id".into()));}
+                lrworkspace_remote::tasks::list(&app.config,&workspace,20)?
+            };
+            println!("{}",serde_json::to_string_pretty(&value)?);
         }
         Commands::Submit {workspace,input,working_dir,batch,submit} => {
             let workspace=app.workspace(workspace.as_deref())?;
@@ -846,6 +874,9 @@ async fn run_guarded(
     force: Option<&str>,
     compute_node: Option<&str>,
     options: &BatchOptions,
+    has_batch: bool,
+    execution_path: &str,
+    background: bool,
 ) -> CoreResult<serde_json::Value> {
     let route = resolve_execution_route(workspace.node_execution_mode, force)?;
     if route == ExecutionRoute::ReadOnly {
@@ -855,9 +886,23 @@ async fn run_guarded(
         let record = app.executor.execute_read_only(workspace, command, working_dir, &Default::default()).await?;
         return Ok(serde_json::json!({"mode":"read-only", "result":record}));
     }
+    if route!=ExecutionRoute::Cluster && execution_path!="auto" {
+        return Err(CoreError::Validation("--execution-path applies only to cluster mode".into()));
+    }
     if route == ExecutionRoute::Cluster {
-        if let Some(node)=compute_node {
-            let record=app.executor.execute_compute_ssh(workspace,node,command,working_dir).await?;
+        if (compute_node.is_some() && execution_path=="submit") || (has_batch && execution_path=="ssh") {
+            return Err(CoreError::Validation("SSH node selection conflicts with scheduler submission/resources".into()));
+        }
+        let selected=if let Some(node)=compute_node {Some(node.to_string())}
+            else if !has_batch && execution_path!="submit" {
+                lrworkspace_remote::compute_ssh::choose_compute_node(&app.executor,&app.config,workspace).await?
+            } else {None};
+        if selected.is_none() && execution_path=="ssh" {
+            return Err(CoreError::NotFound("No reachable idle compute node; workload was not started".into()));
+        }
+        if let Some(node)=selected {
+            if background {return lrworkspace_remote::tasks::start(&app.executor,&app.config,workspace,Some(&node),command,working_dir).await;}
+            let record=app.executor.execute_compute_ssh(workspace,&node,command,working_dir).await?;
             return Ok(serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"result":record}));
         }
         let cluster = match workspace_store::load_cluster_config(&app.config, workspace.id) {
@@ -872,6 +917,7 @@ async fn run_guarded(
         let result=submit_batch(app.executor.clone(),&app.config,workspace,&cluster,&commands,options,working_dir,true,&AgentKind::CliAgent).await?;
         let mut result=serde_json::to_value(result)?;result["mode"]=serde_json::json!("cluster");result["execution_path"]=serde_json::json!("submit");Ok(result)
     } else {
+        if background {return lrworkspace_remote::tasks::start(&app.executor,&app.config,workspace,None,command,working_dir).await;}
         let record = app
             .executor
             .execute_mcp_guarded(workspace, command, working_dir, &Default::default())
@@ -885,6 +931,7 @@ fn remote_exit_code(code: Option<i32>) -> i32 {
 }
 
 fn run_exit_code(value: &serde_json::Value) -> i32 {
+    if value.get("task_id").is_some() { return if value["status"]=="started" {0}else{1}; }
     if value.get("mode").and_then(serde_json::Value::as_str) == Some("cluster") && value.get("execution_path").and_then(serde_json::Value::as_str) != Some("ssh") {
         // Submission success says nothing about the eventual job outcome.
         0

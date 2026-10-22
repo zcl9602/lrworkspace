@@ -16,8 +16,10 @@ pub fn resolve_execution_route(mode: lrworkspace_core::types::NodeExecutionMode,
         NodeExecutionMode::Unconfirmed => Err(CoreError::PermissionDenied("Confirm SSH node mode before running workloads".into())),
         NodeExecutionMode::SubmitOnly if force == Some("direct") => Err(CoreError::PermissionDenied("Direct execution is forbidden on a submit-only login node".into())),
         NodeExecutionMode::SubmitOnly => Ok(ExecutionRoute::Cluster),
-        NodeExecutionMode::DirectCompute if matches!(force, Some("cluster" | "compute-node")) => Ok(ExecutionRoute::Cluster),
-        NodeExecutionMode::DirectCompute => Ok(ExecutionRoute::Direct),
+        NodeExecutionMode::DirectCompute if force == Some("direct") => Ok(ExecutionRoute::Direct),
+        // Legacy registrations may have called a cluster login host direct_compute.
+        // Default to compute-node routing; endpoint execution is always explicit.
+        NodeExecutionMode::DirectCompute => Ok(ExecutionRoute::Cluster),
     }
 }
 
@@ -34,7 +36,8 @@ mod tests {
         assert_eq!(resolve_execution_route(SubmitOnly, None).unwrap(), ExecutionRoute::Cluster);
         assert!(resolve_execution_route(SubmitOnly, Some("direct")).is_err());
         assert!(resolve_execution_route(Unconfirmed, Some("cluster")).is_err());
-        assert_eq!(resolve_execution_route(DirectCompute, None).unwrap(), ExecutionRoute::Direct);
+        assert_eq!(resolve_execution_route(DirectCompute, None).unwrap(), ExecutionRoute::Cluster);
+        assert_eq!(resolve_execution_route(DirectCompute, Some("direct")).unwrap(), ExecutionRoute::Direct);
         assert_eq!(resolve_execution_route(Unconfirmed, Some("read-only")).unwrap(), ExecutionRoute::ReadOnly);
         assert!(resolve_execution_route(DirectCompute, Some("unknown")).is_err());
     }

@@ -7,12 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
 use std::collections::VecDeque;
-use std::io::{self, BufRead, Write};
+#[cfg(test)]
+use std::io::{BufRead,Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
 use uuid::Uuid;
 
 use lrworkspace_audit::AuditLoggerImpl;
@@ -36,6 +37,7 @@ use regex::Regex;
 use std::fs;
 use std::sync::LazyLock;
 mod local_login;
+mod transport;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -92,8 +94,7 @@ struct InitializeResult {
 }
 
 const MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const AGENT_INSTRUCTIONS: &str =
-    "workspace_discover first. Cluster submits unless user names compute node. No delete/sync. Passwords: local workspace_login only.";
+const AGENT_INSTRUCTIONS: &str = "workspace_discover first. Cluster auto-selects compute SSH; no login workloads. Monitor task IDs. No delete/sync; local login.";
 
 fn batch_options(args:&serde_json::Map<String,Value>)->CoreResult<BatchOptions> {
     match args.get("batch") {None=>Ok(BatchOptions::default()),Some(Value::Object(value))=>Ok(serde_json::from_value(Value::Object(value.clone()))?),_=>Err(CoreError::Validation("batch must be an object".into()))}
@@ -249,7 +250,7 @@ pub struct McpServer {
     audit: Arc<AuditLoggerImpl>,
     config: LrWorkspaceConfig,
     agent: std::sync::Mutex<AgentKind>,
-    client_supports_elicitation: bool,
+    client_supports_elicitation: std::sync::atomic::AtomicBool,
     local_logins: local_login::LocalLogins,
 }
 
@@ -270,55 +271,13 @@ impl McpServer {
             executor,
             config,
             agent: std::sync::Mutex::new(agent),
-            client_supports_elicitation: false,
+            client_supports_elicitation: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    pub async fn run(&mut self) -> CoreResult<()> {
-        info!("remote-first MCP server started");
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut pending = VecDeque::new();
-        while let Some(line) = next_protocol_line(&mut reader, &mut pending)? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let response = match serde_json::from_str::<JsonRpcRequest>(line.trim()) {
-                Ok(mut request) => {
-                    if request.id.is_none() && request.method.starts_with("notifications/") {
-                        continue;
-                    }
-                    if self.client_supports_elicitation {
-                        if let Some(params) = elicitation_for_request(&request) {
-                            if let Ok(Some(content)) = request_elicitation(&mut reader, &mut pending, params) {
-                                merge_tool_arguments(&mut request, content);
-                            }
-                        }
-                    }
-                    self.handle_request(&request).await
-                }
-                Err(error) => JsonRpcResponse {
-                    jsonrpc: "2.0".into(),
-                    id: None,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32700,
-                        message: "Parse error".into(),
-                        data: Some(Value::String(error.to_string())),
-                    }),
-                },
-            };
-            let mut stdout = io::stdout().lock();
-            // Preserve protocol constants and caller-generated request IDs.
-            let mut wire=serde_json::to_value(&response)?;
-            for field in ["result","error"] {if let Some(value)=wire.get_mut(field){lrworkspace_core::privacy::redact_value(value);}}
-            writeln!(stdout, "{}", serde_json::to_string(&wire)?)?;
-            stdout.flush()?;
-        }
-        Ok(())
-    }
+    pub async fn run(self) -> CoreResult<()> { transport::run(self).await }
 
-    async fn handle_request(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_request(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         match request.method.as_str() {
             "initialize" => self.initialize(request),
             "ping" => success(request, serde_json::json!({})),
@@ -332,13 +291,13 @@ impl McpServer {
         }
     }
 
-    fn initialize(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
-        self.client_supports_elicitation = request
+    fn initialize(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
+        self.client_supports_elicitation.store(request
             .params
             .as_ref()
             .and_then(|value| value.get("capabilities"))
             .and_then(|value| value.get("elicitation"))
-            .is_some();
+            .is_some(), std::sync::atomic::Ordering::Relaxed);
         if let Some(name) = request
             .params
             .as_ref()
@@ -362,7 +321,7 @@ impl McpServer {
         success(
             request,
             serde_json::to_value(InitializeResult {
-                protocol_version: if self.client_supports_elicitation {
+                protocol_version: if self.client_supports_elicitation.load(std::sync::atomic::Ordering::Relaxed) {
                     "2025-06-18".into()
                 } else {
                     "2024-11-05".into()
@@ -378,7 +337,7 @@ impl McpServer {
         )
     }
 
-    async fn call_request(&mut self, request: &JsonRpcRequest) -> JsonRpcResponse {
+    async fn call_request(&self, request: &JsonRpcRequest) -> JsonRpcResponse {
         let params = request.params.as_ref().and_then(Value::as_object);
         let Some(params) = params else {
             return failure(request, -32602, "Invalid params");
@@ -409,7 +368,7 @@ impl McpServer {
     }
 
     async fn call_tool(
-        &mut self,
+        &self,
         name: &str,
         args: &serde_json::Map<String, Value>,
     ) -> CoreResult<Value> {
@@ -478,6 +437,14 @@ impl McpServer {
         }
         let agent = self.agent.lock().unwrap().clone();
         match name {
+            "workspace_tasks"=>lrworkspace_remote::tasks::list(&self.config,&workspace,
+                args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize),
+            "workspace_task_status"|"workspace_task_logs"=> {
+                let id=Uuid::parse_str(required_string(args,"task_id")?).map_err(|_|CoreError::Validation("Invalid task_id".into()))?;
+                let bytes=if name=="workspace_task_logs" {Some(args.get("max_bytes").and_then(Value::as_u64).unwrap_or(16384) as usize)}else{None};
+                let executor=self.executor.with_timeout(request_timeout(args,self.config.ssh_timeout_secs)?);
+                lrworkspace_remote::tasks::poll(&executor,&self.config,&workspace,id,bytes).await
+            }
             "workspace_update_connection"=> {
                 let port=args.get("port").and_then(Value::as_u64).and_then(|p|u16::try_from(p).ok()).filter(|p|*p>0).ok_or_else(||CoreError::Validation("port must be 1-65535".into()))?;
                 if args.get("confirmed").and_then(Value::as_bool)!=Some(true){return Ok(serde_json::json!({"status":"preview","host":workspace.connection.host,"current_port":workspace.connection.port,"requested_port":port,"instruction":"Confirm this endpoint with the user before calling confirmed:true"}));}
@@ -1142,7 +1109,7 @@ impl McpServer {
             "local_platform": std::env::consts::OS,
             "local_arch": std::env::consts::ARCH,
             "local_data_dir": self.config.data_dir,
-            "elicitation_supported": self.client_supports_elicitation,
+            "elicitation_supported": self.client_supports_elicitation.load(std::sync::atomic::Ordering::Relaxed),
             "workspaces": values,
             "next_action": if values.is_empty() { "Use workspace_login for private local password entry, or workspace_configure for key/agent authentication. Never request passwords in chat." } else { "If authentication_ready is false, call workspace_login with workspace_id. Otherwise call workspace_layout, then workspace_env/index/read/write/run." },
         }))
@@ -1197,6 +1164,16 @@ impl McpServer {
             Some(value) => Some(value.as_str().ok_or_else(|| CoreError::Validation("force must be a string".into()))?),
         };
         let route = resolve_execution_route(workspace.node_execution_mode, force)?;
+        if args.get("background").is_some_and(|value| !value.is_boolean()) {
+            return Err(CoreError::Validation("background must be a boolean".into()));
+        }
+        let execution_path=match args.get("execution_path") {
+            Some(value)=>value.as_str().ok_or_else(||CoreError::Validation("execution_path must be a string".into()))?,
+            None=>"auto",
+        };
+        if !["auto","ssh","submit"].contains(&execution_path) || (route!=ExecutionRoute::Cluster && execution_path!="auto") {
+            return Err(CoreError::Validation("execution_path must be auto, or ssh/submit in cluster mode".into()));
+        }
         if route!=ExecutionRoute::Cluster && args.contains_key("batch") {
             return Err(CoreError::Validation("batch options require force=cluster or a submit-only workspace".into()));
         }
@@ -1214,9 +1191,26 @@ impl McpServer {
                 serde_json::json!({"mode":"read-only", "result":record})
             }
             ExecutionRoute::Cluster => {
-                if let Some(node)=compute_node {
-                    let record=executor.execute_compute_ssh(workspace,node,command,working_dir.as_deref()).await?;
-                    serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"result":record})
+                if compute_node.is_some() && execution_path=="submit" {
+                    return Err(CoreError::Validation("compute_node conflicts with execution_path=submit".into()));
+                }
+                if execution_path=="ssh" && args.contains_key("batch") {
+                    return Err(CoreError::Validation("SSH cannot be combined with scheduler batch resources".into()));
+                }
+                let selected=if let Some(node)=compute_node {Some(node.to_string())}
+                    else if execution_path!="submit" && !args.contains_key("batch") {
+                        lrworkspace_remote::compute_ssh::choose_compute_node(&executor,&self.config,workspace).await?
+                    } else {None};
+                if selected.is_none() && execution_path=="ssh" {
+                    return Err(CoreError::NotFound("No reachable idle compute node; workload was not started".into()));
+                }
+                if let Some(node)=selected {
+                    if args.get("background").and_then(Value::as_bool).unwrap_or(true) {
+                        lrworkspace_remote::tasks::start(&executor,&self.config,workspace,Some(&node),command,working_dir.as_deref()).await?
+                    } else {
+                        let record=executor.execute_compute_ssh(workspace,&node,command,working_dir.as_deref()).await?;
+                        serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"result":record})
+                    }
                 } else {
                     let cluster = match workspace_store::load_cluster_config(&self.config, workspace.id) {
                         Ok(cluster) => cluster,
@@ -1233,8 +1227,12 @@ impl McpServer {
                 }
             }
             ExecutionRoute::Direct => {
-                let record = executor.execute_mcp_guarded(workspace, command, working_dir.as_deref(), &Default::default()).await?;
-                serde_json::json!({"mode":"direct", "result":record})
+                if args.get("background").and_then(Value::as_bool).unwrap_or(true) {
+                    lrworkspace_remote::tasks::start(&executor,&self.config,workspace,None,command,working_dir.as_deref()).await?
+                } else {
+                    let record = executor.execute_mcp_guarded(workspace, command, working_dir.as_deref(), &Default::default()).await?;
+                    serde_json::json!({"mode":"direct", "result":record})
+                }
             }
         };
         let audit_command = command.chars().take(500).collect::<String>();
@@ -1324,7 +1322,7 @@ fn elicitation_for_request(request: &JsonRpcRequest) -> Option<Value> {
                 "requestedSchema": {
                     "type": "object",
                     "properties": {
-                        "node_execution_mode": {"type": "string", "title": "SSH node behavior", "enum": ["submit_only", "single_server", "direct_compute"], "description": "submit_only defaults to scheduler submission; only an explicitly authorized compute_node uses SSH. single_server permits direct execution on a standalone server; direct_compute is its legacy alias"},
+                        "node_execution_mode": {"type": "string", "title": "SSH node behavior", "enum": ["submit_only", "single_server", "direct_compute"], "description": "submit_only never runs workloads on the login endpoint; cluster automatically selects idle compute SSH nodes, or submits to the scheduler. single_server permits explicit force=direct on a standalone server; default execution remains cluster; direct_compute is its legacy alias"},
                         "confirmed": {"type": "boolean", "title": "I confirm this node behavior", "default": false}
                     },
                     "required": ["node_execution_mode", "confirmed"]
@@ -1335,6 +1333,7 @@ fn elicitation_for_request(request: &JsonRpcRequest) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
 fn next_protocol_line<R: BufRead>(
     reader: &mut R,
     pending: &mut VecDeque<String>,
@@ -1350,26 +1349,7 @@ fn next_protocol_line<R: BufRead>(
     }
 }
 
-fn request_elicitation<R: BufRead>(
-    reader: &mut R,
-    pending: &mut VecDeque<String>,
-    params: Value,
-) -> CoreResult<Option<serde_json::Map<String, Value>>> {
-    let id = format!("lrw-elicitation-{}", Uuid::new_v4());
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": "elicitation/create",
-        "params": params,
-    });
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{}", serde_json::to_string(&request)?)?;
-    stdout.flush()?;
-    drop(stdout);
-
-    wait_for_elicitation_response(reader, pending, &id)
-}
-
+#[cfg(test)]
 fn wait_for_elicitation_response<R: BufRead>(
     reader: &mut R,
     pending: &mut VecDeque<String>,
@@ -1455,7 +1435,10 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         tool("workspace_search_files", "Search file names in work or data:N. On unconfirmed/submit_only nodes this lists Git tracked and unignored paths and never runs find/rg recursively.", serde_json::json!({"workspace_id": {"type": "string"}, "root": {"type": "string", "default": "work"}, "pattern": {"type": "string"}}), &["pattern"]),
         tool("workspace_read_file", "Read a remote work/data file; no local copy is created.", rooted_path, &["relative_path"]),
         tool("workspace_write_file", "Upload a file from the agent's own project via local_path, or supply UTF-8 content. Exactly one input is required. Writes stay under the remote work root; no local project registration. transport=rsync/scp/base64 is strict; auto may fall back. Returns the actual transport.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","enum":["work"],"default":"work"},"relative_path":{"type":"string"},"content":{"type":"string"},"local_path":{"type":"string","description":"Existing file in the agent's own local project"},"transport":{"type":"string","enum":["auto","rsync","scp","base64"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path"]),
-        tool("workspace_run", "Run under real SSH permissions with working_dir inside the remote work root. force=cluster defaults to Slurm/PBS command arrays; resources and concurrency are set in batch. Only when the user explicitly authorizes a compute hostname, pass compute_node to SSH from the login host and execute there; no scheduler allocation, no automatic node selection, no login-node fallback or resubmission. direct is single-server execution. submit_only defaults to cluster and forbids direct. direct_compute defaults to direct. read-only permits only allowlisted queries. timeout_sec controls this operation, default 120.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Explicit user-authorized compute hostname: SSH from login host instead of submitting; cluster only, incompatible with batch. Omit to submit."},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"]},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
+        tool("workspace_run", "Run independent commands under real SSH permissions. Cluster auto discovers reachable idle compute nodes and uses SSH; if none is available, submit to Slurm/PBS. execution_path=submit or batch resources force scheduler submission. Never execute workloads on the login endpoint. SSH workloads default to background=true and return a durable task_id; monitor via workspace_task_status/logs and workspace_tasks. background=false waits for output. direct is only for explicitly configured standalone servers. timeout_sec budgets SSH operations, not the lifetime of detached tasks. No automatic replay after an uncertain launch.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Optional explicit compute hostname; omitted means automatic discovery."},"execution_path":{"type":"string","enum":["auto","ssh","submit"],"default":"auto"},"background":{"type":"boolean","default":true},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"],"default":"cluster"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
+        tool("workspace_tasks", "List independent SSH task handles in this workspace without contacting a server. Returned states are last observations; query task_id for live state. Never deletes tasks or logs.", serde_json::json!({"workspace_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}}), &[]),
+        tool("workspace_task_status", "Read one SSH task's live state, exit code and actual hostname without waiting for other commands. Unknown is not success. Handles survive MCP restart.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
+        tool("workspace_task_logs", "Read independent bounded stdout/stderr tails and live task state. Output is read on the recorded compute node; empty output is not completion evidence.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_submit", "Build the supplied command-file array mode: filter blank/comments, shuffle, balance at most 1000 task scripts, bound concurrency by maxnum and maxcpu/(ntasks*cpu), continue after individual failures, and report aggregate failure. Provide exactly one of local_path or commands_text. Every run gets a fresh directory; prior files are retained. Default generates only; submit=true launches. PBS flavor is detected or explicitly pbs-pro/torque.", serde_json::json!({"workspace_id":{"type":"string"},"local_path":{"type":"string"},"commands_text":{"type":"string"},"batch":batch_schema(),"working_dir":{"type":"string"},"submit":{"type":"boolean","default":false},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &[]),
         tool("workspace_cluster_info", "Discover scheduler and cluster topology.", workspace.clone(), &[]),
         tool("workspace_slurm_status", "Read scheduler job status (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
@@ -1623,7 +1606,7 @@ mod tests {
     #[tokio::test]
     async fn passwords_are_rejected_as_tool_arguments_without_echo_or_persistence() {
         let root=std::env::temp_dir().join(format!("lrw-no-secret-args-{}",Uuid::new_v4()));
-        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let mut server=McpServer::new(config,AgentKind::CliAgent).unwrap();
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let server=McpServer::new(config,AgentKind::CliAgent).unwrap();
         let request:JsonRpcRequest=serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"workspace_login","arguments":{"password":"unregistered-input-canary-8357"}}})).unwrap();
         let response=server.handle_request(&request).await;let wire=serde_json::to_string(&response).unwrap();assert!(!wire.contains("unregistered-input-canary"));assert!(response.error.is_some());
         assert!(!root.exists()||std::fs::read_dir(&root).unwrap().next().is_none());

@@ -66,8 +66,8 @@ pub enum NodeExecutionMode {
     #[default]
     Unconfirmed,
     /// The SSH endpoint is a login/submission node. Workloads are submitted to
-    /// the scheduler unless this request explicitly names an authorized compute
-    /// SSH target. Control-plane queries and file transfers still use this endpoint.
+    /// a discovered idle compute node through SSH, or to the scheduler when
+    /// requested/unavailable. Workloads never run on this login endpoint.
     SubmitOnly,
     /// Standalone-server mode (legacy storage name). The user confirmed computation on
     /// the SSH endpoint.

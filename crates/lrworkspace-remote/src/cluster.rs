@@ -59,10 +59,10 @@ case "$SCHED" in
         ;;
     pbs)
         pbsnodes -a 2>/dev/null | awk '
-            /^[a-zA-Z]/ { if (name != "") { printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, state, queue } name=$1; cores="1"; mem="0"; gpus="0"; state="?"; queue="default" }
+            /^[a-zA-Z]/ { if (name != "") { printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, (busy ? "alloc" : state), queue } name=$1; busy=0; explicit_state=0; cores="1"; mem="0"; gpus="0"; state="?"; queue="default" }
             /^[[:space:]]*np[[:space:]]*=/ { n=$3; gsub(/[^0-9]/,"",n); cores=n }
-            /^[[:space:]]*state[[:space:]]*=/ && $0 !~ /status/ { s=$3; gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); state=s }
-            /^[[:space:]]*ntype/ { if ($3 == "cluster") state="free" }
+            /^[[:space:]]*state[[:space:]]*=/ && $0 !~ /status/ { s=$3; gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); state=s; explicit_state=1 }
+            /^[[:space:]]*jobs[[:space:]]*=/ && NF>=3 { busy=1 }
             /status[[:space:]]*=/ {
                 # Parse comma-separated key=value pairs
                 rest=$0; gsub(/^[[:space:]]*status[[:space:]]*=[[:space:]]*/,"",rest);
@@ -70,13 +70,13 @@ case "$SCHED" in
                 for (i=1; i<=n; i++) {
                     kv=kvs[i]; gsub(/^[[:space:]]+|[[:space:]]+$/,"",kv);
                     if (kv ~ /^physmem=/) { v=kv; gsub(/[^0-9]/,"",v); mem=v }
-                    if (kv ~ /^state=/) { v=kv; sub(/^state=/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); state=v }
+                    if (!explicit_state && kv ~ /^state=/) { v=kv; sub(/^state=/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); state=v }
                     if (kv ~ /^ncpus=/) { v=kv; gsub(/[^0-9]/,"",v); cores=v }
                     if (kv ~ /^gres=/ && kv !~ /gres=\s*,/) { v=kv; gsub(/[^a-zA-Z0-9:]/,"",v); sub(/^gres=/,"",v); gpus=v }
                 }
             }
             /^[[:space:]]*physmem[[:space:]]*=/ && $0 !~ /status/ { m=$3; gsub(/[^0-9]/,"",m); mem=m }
-            END { if (name != "") printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, state, queue }
+            END { if (name != "") printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, (busy ? "alloc" : state), queue }
         ' 2>/dev/null
         ;;
     sge)
@@ -493,6 +493,22 @@ qconf() { :; }
             assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
             assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("---SCHEDULER---\n{expected}\n")),"{}",String::from_utf8_lossy(&output.stdout));
         }
+    }
+
+    #[test]
+    fn pbs_node_type_never_overrides_offline_or_allocated_state() {
+        #[cfg(windows)] let bash=r"C:\Program Files\Git\bin\bash.exe";
+        #[cfg(unix)] let bash="/bin/bash";
+        let stubs=r#"
+command() { case "$1:$2" in -v:qsub) return 0;; *) return 1;; esac; }
+qstat() { :; }
+pbsnodes() { printf '%s\n' 'node-offline' '    state = offline' '    ntype = cluster' '    status = state=free' 'node-busy' '    state = free' '    ntype = cluster' '    jobs = 0/123.server' '    status = state=free,ncpus=32' 'node-idle' '    state = free' '    ntype = cluster'; }
+"#;
+        let output=std::process::Command::new(bash).args(["-c",&format!("{stubs}\n{CLUSTER_DETECT_SCRIPT}")]).output().unwrap();
+        assert!(output.status.success());let text=String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("node-offline 1 0 0 offline default"),"{text}");
+        assert!(text.contains("node-busy 32 0 0 alloc default"),"{text}");
+        assert!(text.contains("node-idle 1 0 0 free default"),"{text}");
     }
 
     #[test]

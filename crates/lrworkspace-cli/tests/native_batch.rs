@@ -14,7 +14,7 @@ impl Fixture {
         let source=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_scheduler.rs");
         let compiled=Command::new("rustc").arg(source).arg("-o").arg(&executable).output().unwrap();
         assert!(compiled.status.success(),"{}",String::from_utf8_lossy(&compiled.stderr));
-        for program in ["ssh","scp","rsync","sbatch","qsub","hostname"] {
+        for program in ["ssh","scp","rsync","sbatch","qsub","hostname","sinfo"] {
             let name=if cfg!(windows){format!("{program}.exe")}else{program.into()};
             std::fs::copy(&executable,root.join("bin").join(name)).unwrap();
         }
@@ -32,6 +32,9 @@ impl Fixture {
         std::fs::write(root.join("work/previous-result"),b"keep").unwrap();
         Some(Self {root,bash,config,workspace})
     }
+    fn enable_background_fixture(&self) {
+        std::fs::copy(self.root.join("helper.exe"),self.root.join("bin").join(if cfg!(windows){"setsid.exe"}else{"setsid"})).unwrap();
+    }
     fn command(&self)->Command {
         self.command_for(Path::new(env!("CARGO_BIN_EXE_rw")))
     }
@@ -44,7 +47,7 @@ impl Fixture {
             .env("LRWORKSPACE_SSH",self.root.join("bin").join(if cfg!(windows){"ssh.exe"}else{"ssh"})).env("LRWORKSPACE_SCP",self.root.join("bin").join(if cfg!(windows){"scp.exe"}else{"scp"}))
             .env("LRWORKSPACE_CONFIG",self.root.join("config.toml")).env("LRWORKSPACE_DATA_DIR",&self.config.data_dir)
             .env("LRWORKSPACE_RSYNC",self.root.join("bin").join(if cfg!(windows){"rsync.exe"}else{"rsync"}))
-            .env("MSYS2_ENV_CONV_EXCL","LRW_TEST_BIN_POSIX").env("LRW_TEST_BIN_POSIX",posix(&self.root.join("bin"))).env("LRW_TEST_SSH_LOG",self.root.join("compute-ssh.log")).env_remove("LRW_TEST_COMPUTE_FAILURE").env_remove("LRW_TEST_ON_COMPUTE").env_remove("LRW_TEST_SAME_HOST")
+            .env("MSYS2_ENV_CONV_EXCL","LRW_TEST_BIN_POSIX").env("LRW_TEST_BIN_POSIX",posix(&self.root.join("bin"))).env("LRW_TEST_SSH_LOG",self.root.join("compute-ssh.log")).env_remove("LRW_TEST_COMPUTE_FAILURE").env_remove("LRW_TEST_ON_COMPUTE").env_remove("LRW_TEST_SAME_HOST").env_remove("LRW_TEST_IDLE_COMPUTE")
             .env("LRW_TEST_BASH",&self.bash).env("LRW_TEST_SUBMIT_LOG",self.root.join("submissions.log"))
             .env_remove("LRWORKSPACE_FILE_THRESHOLD_MB").env_remove("LRWORKSPACE_SSH_TIMEOUT")
             .current_dir(&self.root);
@@ -125,7 +128,7 @@ fn mcp_command_array_submission_uses_the_same_pbs_backend() {
     ] {writeln!(input,"{request}").unwrap();}
     drop(input);let output=child.wait_with_output().unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-    let responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect(); responses.sort_by_key(|v|v["id"].as_u64());
     assert_eq!(responses.len(),2);assert!(responses[1].get("error").is_none(),"{}",responses[1]);
     let result:serde_json::Value=serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(result["job_id"],"4243[].server");assert_eq!(result["batch"]["array_parallel"],2);
@@ -183,11 +186,11 @@ fn mcp_cluster_ssh_uses_the_same_explicit_node_route() {
     let mut input=child.stdin.take().unwrap();
     for request in [
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"ssh-test"}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_run","arguments":{"workspace_id":"fixture","command":"hostname -s; exit 9","force":"cluster","compute_node":"compute01","timeout_sec":30}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"workspace_id":"fixture","command":"touch should-not-run","force":"cluster","compute_node":"compute01","batch":{}}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","command":"hostname -s; exit 9","force":"cluster","compute_node":"compute01","timeout_sec":30}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","command":"touch should-not-run","force":"cluster","compute_node":"compute01","batch":{}}}}),
     ] {writeln!(input,"{request}").unwrap();}
     drop(input);let output=child.wait_with_output().unwrap();assert!(output.status.success());
-    let responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect(); responses.sort_by_key(|v|v["id"].as_u64());
     let result:serde_json::Value=serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(result["execution_path"],"ssh");assert_eq!(result["result"]["exit_code"],9);
     assert!(result["result"]["stdout"].as_str().unwrap().contains("compute-fixture"));
@@ -245,13 +248,168 @@ fn mcp_truncated_output_preserves_the_next_request() {
     let mut child=f.command_for(&exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();let mut input=child.stdin.take().unwrap();
     for request in [
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"bounded-output-test"}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_run","arguments":{"workspace_id":"fixture","force":"direct","command":"head -c 12582912 /dev/zero | tr '\\0' x; exit 7","timeout_sec":30}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"workspace_id":"fixture","force":"direct","command":"printf after","timeout_sec":30}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","force":"direct","command":"head -c 12582912 /dev/zero | tr '\\0' x; exit 7","timeout_sec":30}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","force":"direct","command":"printf after","timeout_sec":30}}}),
     ] {writeln!(input,"{request}").unwrap();}
     drop(input);let output=child.wait_with_output().unwrap();assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
-    let responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+    let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect(); responses.sort_by_key(|v|v["id"].as_u64());
     let first:serde_json::Value=serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     let second:serde_json::Value=serde_json::from_str(responses[2]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(first["result"]["output_truncated"],true);assert_eq!(first["result"]["exit_code"],7);assert_eq!(first["result"]["stdout"].as_str().unwrap().len(),10*1024*1024);
     assert_eq!(second["result"]["stdout"],"after");assert_eq!(second["result"]["output_truncated"],false);
+}
+
+struct McpClient {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+    output: std::sync::mpsc::Receiver<serde_json::Value>,
+}
+impl McpClient {
+    fn new(f:&Fixture, automatic_nodes:bool)->Self {
+        use std::io::BufRead;
+        use std::process::Stdio;
+        let binary=Path::new(env!("CARGO_BIN_EXE_rw")).parent().unwrap()
+            .join(if cfg!(windows){"lrworkspace-mcp.exe"}else{"lrworkspace-mcp"});
+        assert!(binary.is_file(),"Build the matching MCP binary first");
+        let mut command=f.command_for(&binary);
+        if automatic_nodes {command.env("LRW_TEST_IDLE_COMPUTE","1");}
+        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+        let input=child.stdin.take();let stdout=child.stdout.take().unwrap();
+        let (sender,output)=std::sync::mpsc::channel();
+        std::thread::spawn(move||{
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line)=line else{break};
+                let value=serde_json::from_str(&line).unwrap();
+                if sender.send(value).is_err(){break;}
+            }
+        });
+        let mut client=Self{child,input,output};
+        client.send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"concurrency-test"}}}));
+        assert_eq!(client.reply()["id"],1);client
+    }
+    fn send(&mut self,value:serde_json::Value) {
+        use std::io::Write;
+        let input=self.input.as_mut().unwrap();writeln!(input,"{value}").unwrap();input.flush().unwrap();
+    }
+    fn call(&mut self,id:u64,name:&str,arguments:serde_json::Value) {
+        self.send(serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}));
+    }
+    fn reply(&self)->serde_json::Value {self.output.recv_timeout(std::time::Duration::from_secs(15)).expect("MCP response blocked behind another request")}
+    fn result(&self)->serde_json::Value {
+        let response=self.reply();assert!(response.get("error").is_none(),"{response}");
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }
+}
+impl Drop for McpClient {
+    fn drop(&mut self){self.input.take();let _=self.child.kill();let _=self.child.wait();}
+}
+
+#[test]
+#[ignore="requires matching MCP binary; barrier-controlled fake SSH, no remote server"]
+fn mcp_concurrent_same_host_commands_ping_and_timeout_are_independent() {
+    let Some(mut f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    f.workspace.node_execution_mode=NodeExecutionMode::DirectCompute;
+    workspace_store::save_workspace(&f.config,&f.workspace).unwrap();
+    let mut client=McpClient::new(&f,false);
+    client.call(2,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct","background":false,
+        "command":"printf started > a-started; for i in $(seq 1 400); do test -f gate-a && break; sleep 0.05; done; printf alpha; exit 7","timeout_sec":30}));
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    while !f.root.join("work/a-started").exists(){assert!(std::time::Instant::now()<deadline);std::thread::sleep(std::time::Duration::from_millis(10));}
+    client.call(3,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct","background":false,"command":"printf beta","timeout_sec":10}));
+    let reply=client.reply();assert_eq!(reply["id"],3,"second command must finish while first is blocked: {reply}");
+    let beta:serde_json::Value=serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(beta["result"]["stdout"],"beta");
+    client.send(serde_json::json!({"jsonrpc":"2.0","id":4,"method":"ping"}));assert_eq!(client.reply()["id"],4);
+    client.call(5,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct","background":false,"command":"sleep 3","timeout_sec":1}));
+    let timeout=client.reply();assert_eq!(timeout["id"],5);assert!(timeout.get("error").is_some(),"{timeout}");
+    client.call(6,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct","background":false,"command":"touch gate-a; printf after-timeout","timeout_sec":10}));
+    let mut replies=vec![client.reply(),client.reply()];replies.sort_by_key(|v|v["id"].as_u64());
+    assert_eq!(replies[0]["id"],2);assert_eq!(replies[1]["id"],6);
+    let values:Vec<serde_json::Value>=replies.iter().map(|r|{
+        assert!(r.get("error").is_none(),"{r}");serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    }).collect();
+    assert_eq!(values[0]["result"]["exit_code"],7);assert_eq!(values[0]["result"]["stdout"],"alpha");
+    assert_eq!(values[1]["result"]["stdout"],"after-timeout");
+}
+
+#[test]
+fn cluster_automatically_selects_idle_compute_nodes_and_can_explicitly_submit() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let result=success(f.command().env("LRW_TEST_IDLE_COMPUTE","1").args(["run","--workspace","fixture","--","hostname -s"]).output().unwrap());
+    assert_eq!(result["execution_path"],"ssh");assert_eq!(result["compute_node"],"compute01");
+    assert!(result["result"]["stdout"].as_str().unwrap().contains("compute-fixture"));
+    let result=success(f.command().env("LRW_TEST_IDLE_COMPUTE","1").args(["run","--workspace","fixture","--execution-path","submit","--","touch should-not-run-on-login"]).output().unwrap());
+    assert_eq!(result["execution_path"],"submit");assert_eq!(result["job_id"],"4242");
+    let rejected=f.command().env("LRW_TEST_IDLE_COMPUTE","1").env("LRW_TEST_SAME_HOST","1")
+        .args(["run","--workspace","fixture","--execution-path","ssh","--","touch should-not-run-on-login"]).output().unwrap();
+    assert!(!rejected.status.success());assert!(!f.root.join("work/should-not-run-on-login").exists());
+}
+
+#[test]
+fn independent_cli_task_handles_preserve_quoted_paths_exit_codes_and_other_tasks() {
+    let Some(mut f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    f.enable_background_fixture();
+    let work=f.root.join("work space ' quoted");std::fs::create_dir(&work).unwrap();
+    f.workspace.remote_work_dir=posix(&work);
+    workspace_store::save_workspace(&f.config,&f.workspace).unwrap();
+    let launched=success(f.command().args(["run","--workspace","fixture","--compute-node","compute01","--background","--","printf 'quoted path payload'; exit 7"]).output().unwrap());
+    assert_eq!(launched["status"],"started","{launched}");
+    let id=launched["task_id"].as_str().unwrap();
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    let outcome=loop {
+        let state=success(f.command().args(["tasks","--workspace","fixture","--task-id",id,"--logs"]).output().unwrap());
+        if state["status"]=="failed" {break state;}
+        assert!(std::time::Instant::now()<deadline,"{state}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(outcome["exit_code"],7);assert_eq!(outcome["stdout"],"quoted path payload");
+    // A concurrent atomic write must not make the task-list reader parse a partial temporary file.
+    let jobs=f.config.data_dir.join("jobs").join(f.workspace.id.to_string());
+    std::fs::write(jobs.join("7461736b2d.pending.tmp"),b"{partial").unwrap();
+    let listing=success(f.command().args(["tasks","--workspace","fixture"]).output().unwrap());
+    assert_eq!(listing["tasks"].as_array().unwrap().len(),1);
+    assert_eq!(std::fs::read(f.root.join("work/previous-result")).unwrap(),b"keep");
+}
+
+#[test]
+#[ignore="requires matching MCP binary; independent detached tasks on a local fake compute host"]
+fn mcp_concurrent_background_tasks_have_live_logs_and_survive_restart() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    f.enable_background_fixture();
+    let mut client=McpClient::new(&f,true);
+    for (id,label,exit) in [(2,"c",9),(3,"d",0)] {
+        let command=format!("printf '{label}-start\\n'; printf '{label}-stderr\\n' >&2; for i in $(seq 1 600); do test -f gate-{label} && break; sleep 0.05; done; printf '{label}-end'; exit {exit}");
+        client.call(id,"workspace_run",serde_json::json!({"workspace_id":"fixture","command":command}));
+    }
+    let first=client.result();let second=client.result();
+    assert_eq!(first["status"],"started","{first}");assert_eq!(second["status"],"started","{second}");
+    let ids=[first["task_id"].as_str().unwrap().to_string(),second["task_id"].as_str().unwrap().to_string()];
+    assert_ne!(ids[0],ids[1]);
+    client.call(4,"workspace_task_logs",serde_json::json!({"workspace_id":"fixture","task_id":ids[0],"max_bytes":65536}));
+    let logs=client.result();assert_eq!(logs["status"],"running","{logs}");
+    assert_eq!(logs["hostname"],"compute-fixture");assert!(logs["stdout"].as_str().unwrap().contains("-start"));
+    assert!(logs["stderr"].as_str().unwrap().contains("-stderr"));
+    drop(client);
+    let mut client=McpClient::new(&f,true);
+    client.call(2,"workspace_tasks",serde_json::json!({"workspace_id":"fixture"}));
+    assert_eq!(client.result()["tasks"].as_array().unwrap().len(),2);
+    // Release both previously detached runners from the new MCP process.
+    client.call(3,"workspace_run",serde_json::json!({"workspace_id":"fixture","compute_node":"compute01","background":false,"command":"touch gate-c gate-d"}));
+    assert_eq!(client.result()["result"]["exit_code"],0);
+    let mut outcomes=Vec::new();
+    for (index,id) in ids.iter().enumerate() {
+        for _ in 0..20 {
+            client.call(10+index as u64,"workspace_task_logs",serde_json::json!({"workspace_id":"fixture","task_id":id,"max_bytes":4}));
+            let status=client.result();
+            if status["status"]=="succeeded" || status["status"]=="failed" {
+                assert!(status["stdout_truncated"].as_bool().unwrap());outcomes.push(status);break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    assert_eq!(outcomes.len(),2);outcomes.sort_by_key(|v|v["exit_code"].as_i64());
+    assert_eq!(outcomes[0]["status"],"succeeded");assert_eq!(outcomes[0]["exit_code"],0);
+    assert_eq!(outcomes[1]["status"],"failed");assert_eq!(outcomes[1]["exit_code"],9);
+    assert!(!f.root.join("submissions.log").exists(),"automatic SSH must not also submit a duplicate job");
+    assert_eq!(std::fs::read(f.root.join("work/previous-result")).unwrap(),b"keep");
 }

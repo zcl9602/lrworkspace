@@ -11,7 +11,7 @@
 | cli | rw/lrworkspace 命令行，用户级 MCP 安装 |
 | mcp | stdio 请求、工具 schema、表单、授权及诊断 journal |
 
-`resolve_execution_route` 同时供 CLI/MCP 使用，统一处理 cluster/direct/read-only。旧 `--force compute-node` 只映射为 cluster；cluster 默认提交，本次显式 `--compute-node HOST` 时通过登录节点 SSH 执行。不自动选择缓存空闲节点。单服务器模式 `single-server`（存储兼容 direct_compute）默认 direct，代码不根据命令字符串猜测计算地点。
+`resolve_execution_route` 同时供 CLI/MCP 使用，统一处理 cluster/direct/read-only。旧 `--force compute-node` 只映射为 cluster；cluster 默认根据新发现的调度器状态自动选择可达的空闲计算节点；可指定 `--compute-node HOST` 或 `--execution-path submit`。没有可用节点或提供 batch 资源时提交调度器。所有 workload 默认 cluster；单服务器模式 `single-server`（存储兼容 direct_compute）允许显式 direct，代码不根据命令字符串猜测计算地点。
 
 ## 文件和状态
 
@@ -45,11 +45,11 @@ CLI/MCP 小文件读取使用有界 SSH，独立的库级完整下载 API 仍保
 
 文件 API 限定 work/data 根，写入只接受 work；命令按 SSH 用户真实权限执行，没有 OS 级只读沙箱。目录校验也不构成对并发 symlink 替换的完整隔离。不得将数据根只读约定理解为 Unix 权限已改变。
 
-submit_only 的 workload 默认经调度器；仅本次明确授权的 compute_node 可走 SSH 第二跳。控制查询和文件访问仍在登录 endpoint；提交路径缺失调度器时失败，SSH 路径不依赖调度器。两条路径均不回落登录节点，未确认模式不执行 workload。
+submit_only 的 workload 默认自动选择空闲计算节点走 SSH 第二跳，不可用时经调度器；显式 compute_node 可固定节点。控制查询和文件访问仍在登录 endpoint；提交路径缺失调度器时失败，SSH 路径不依赖调度器。两条路径均不回落登录节点，未确认模式不执行 workload。
 
 作业未知或队列无记录不等于完成。日志缺失/不可读在现有日志接口中仍可能表现为空内容，需结合明确终态及实际输出核对。诊断分类只是排查线索。
 
-默认操作预算 120 秒，CLI/MCP 参数可覆盖。调度器作业时限独立；轮询预算也不包含所有在途 SSH 与收尾耗时。MCP 仍串行处理请求；表单期间交错消息暂存后按序处理，不会自动确认。
+默认操作预算 120 秒，CLI/MCP 参数可覆盖。调度器作业时限独立；轮询预算也不包含所有在途 SSH 与收尾耗时。MCP 并发处理独立请求并按请求 ID 关联响应；表单等待不阻塞其他调用，也不会自动确认。Windows 端点使用有界 SSH 会话池，默认后台命令使用独立远端进程与持久句柄；监控日志读取有界尾部。
 
 运行时不自动安装 OpenSSH、提升系统权限或创建本地项目绑定。Windows 使用原生 exe；Unix 系统 SSH 使用 ControlMaster，部分备用读取依赖 ssh2。
 

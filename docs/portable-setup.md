@@ -1,4 +1,4 @@
-# Windows / macOS 安装与环境检查（0.5.1）
+# Windows / macOS 安装与环境检查（0.6.0）
 
 使用自己平台的完整压缩包，三个程序保留在同一目录。Windows 使用 x86_64；Apple Silicon 使用 macOS aarch64；Intel Mac 使用 macOS x86_64，Mac 构建的最低系统目标为 macOS 12。运行发布程序不需要 Rust、Python、Git 或 WSL。基本功能需要本机 OpenSSH 的 ssh/scp；远端仍面向有 Bash、GNU 工具和可选 Slurm/PBS 的 Linux。
 
@@ -50,7 +50,7 @@ Host my-cluster
     HostName 192.0.2.20
     Port 2222
     User alice
-    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.5.1-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
+    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.6.0-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
 ```
 
 Mac 将程序位置替换为安装输出的绝对路径（没有 `.exe`）。代理地址/端口使用自己的设置；没有代理就省略 ProxyCommand。内置转发只支持无需用户名/密码的 SOCKS5；其它认证代理沿用合适的 ProxyCommand。代理只向 stdout 转发二进制，诊断走 stderr，握手默认 10 秒，可用 `--connect-timeout` 改。
@@ -72,4 +72,4 @@ Windows rsync 使用匹配的原生发行版和配套 SSH。Cygwin SSH 的代理
 | `LRWORKSPACE_RSYNC_SHELL` | Windows rsync 子进程使用的 POSIX shell |
 | `LRWORKSPACE_SSH_TIMEOUT` | 默认命令预算秒数，须大于 0 |
 
-不要复制他人的 `.lrworkspace` 注册或 SSH 私钥。登录节点默认仍通过 Slurm/PBS 提交；只有本次明确指定 `--compute-node` 才经登录节点 SSH 到计算节点。`direct` 用于单服务器。
+不要复制他人的 `.lrworkspace` 注册或 SSH 私钥。登录节点不运行任务；cluster 默认自动发现可用计算节点并 SSH，未找到可用节点时经 Slurm/PBS 提交。可用 `--execution-path submit` 固定走调度器。`direct` 用于单服务器。

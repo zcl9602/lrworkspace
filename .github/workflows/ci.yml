@@ -53,6 +53,8 @@ jobs:
         run: cargo test -p lrworkspace-cli --test native_batch mcp_command_array --locked -- --ignored --nocapture
       - name: Run MCP compute-node SSH integration
         run: cargo test -p lrworkspace-cli --test native_batch mcp_cluster_ssh --locked -- --ignored --nocapture
+      - name: Run independent MCP commands and durable task monitoring
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_concurrent --locked -- --ignored --nocapture
       - name: Run MCP bounded-output session regression
         run: cargo test -p lrworkspace-cli --test native_batch mcp_truncated --locked -- --ignored --nocapture
       - name: Test clean user installation and minimal PATH

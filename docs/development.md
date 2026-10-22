@@ -40,7 +40,7 @@ portable 测试使用全新中文/空格用户目录、独立 CODEX_HOME、旧�
 
 0.5.0 的普通测试覆盖本机 UI 控件、证书固定、能力令牌与端点绑定、状态/注册/审计/日志脱敏和注销。CI 四个平台另用 Paramiko 合成 localhost 服务验证实际 OpenSSH 正确/错误密码；Windows/macOS 验证原生窗口到 Rust helper 的私有表单交接。Python/Paramiko 仅是测试依赖，安装包不需要它们。Ubuntu 还显式启动一次性 sshd/临时系统账户验证密码模式的 SCP、rsync 二进制上传、未知主机拒绝和注销；此测试须设置 `LRW_RUN_ISOLATED_SSHD_TEST=1`，仅可在可丢弃 runner/container 执行。原生控件自检不代替人工 GUI 操作或用户真实集群认证验收。
 
-- cluster 默认数组提交；只有显式 compute-node 目标可走第二跳 SSH，失败不回落/重提。旧 --force compute-node 仍是 cluster 别名。
+- cluster 自动发现并探测空闲计算节点；没有可用节点或提供 batch 资源时调度提交。实际 workload 失败不回落/重提。旧 --force compute-node 仍是 cluster 别名。
 - CLI/MCP 共用节点模式决策，不按命令文本猜测计算地点。
 - 无本地项目目录/marker/cwd 绑定，旧字段可读取但不创建旧目录。
 - 文件上传的子进程输出必须捕获，显式 rsync 不允许回退伪装成功。
@@ -61,7 +61,7 @@ portable 测试使用全新中文/空格用户目录、独立 CODEX_HOME、旧�
 | 显式 rsync 无法认证/远端缺 rsync | 明确报错；不回退伪装 rsync 成功 |
 | 传输过程中超时/断连 | 返回失败、终止本次子进程；保留原目标 |
 | 路径逃逸、data 写入口、根外 symlink | 文件 API 拒绝且测试 data 不变 |
-| cluster 默认提交 | 调度器返回 job ID，实际 hostname 是分配的计算节点 |
+| cluster + execution_path=submit | 调度器返回 job ID，实际 hostname 是分配的计算节点 |
 | cluster + 显式 compute-node | 经登录节点第二跳，实际 hostname 为指定节点，保留命令退出码 |
 | SSH 失败/别名回到登录节点 | 拒绝，不回落或重复提交 |
 | submit_only + direct | 拒绝 |
@@ -94,3 +94,12 @@ cargo test -p lrworkspace-cli --test native_batch mcp_truncated --locked -- --ig
 ```
 
 此测试在同一个 MCP 进程中先接收超过限制的输出，再执行下一条命令，校验真实退出码和会话帧未被破坏；不连接服务器。Windows 调用真实本机 rsync 往返的测试也应显式执行，不能把 fake SSH 测试视为真实认证验收。
+
+## 0.6.0 并发回归
+
+```text
+cargo build -p lrworkspace-cli -p lrworkspace-mcp --locked
+cargo test -p lrworkspace-cli --test native_batch mcp_concurrent --locked -- --ignored --nocapture
+```
+
+真实 stdio 进程与本机模拟 SSH 验证：同一主机长命令被门控等待时，第二命令和 ping 可返回；单次超时不终止其他命令；默认自动选择计算节点；两个后台任务日志和退出码独立，重启 MCP 后仍可查询。表单未完成时 ping 和工具列表也须响应。Mac 本地测试通过专用的 setsid helper 模拟 Linux 进程会话，不需要用户机器安装 util-linux；真实远端仍需 Linux setsid。CI 显式执行这些集成测试。
