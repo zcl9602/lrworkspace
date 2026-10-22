@@ -357,7 +357,7 @@ fn independent_cli_task_handles_preserve_quoted_paths_exit_codes_and_other_tasks
     let id=launched["task_id"].as_str().unwrap();
     let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
     let outcome=loop {
-        let state=success(f.command().args(["tasks","--workspace","fixture","--task-id",id,"--logs"]).output().unwrap());
+        let state=success(f.command().args(["tasks","--workspace","fixture","--id",id,"--logs"]).output().unwrap());
         if state["status"]=="failed" {break state;}
         assert!(std::time::Instant::now()<deadline,"{state}");
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -365,7 +365,7 @@ fn independent_cli_task_handles_preserve_quoted_paths_exit_codes_and_other_tasks
     assert_eq!(outcome["exit_code"],7);assert_eq!(outcome["stdout"],"quoted path payload");
     // A concurrent atomic write must not make the task-list reader parse a partial temporary file.
     let jobs=f.config.data_dir.join("jobs").join(f.workspace.id.to_string());
-    std::fs::write(jobs.join("7461736b2d.pending.tmp"),b"{partial").unwrap();
+    std::fs::write(jobs.join("657865632d.pending.tmp"),b"{partial").unwrap();
     let listing=success(f.command().args(["tasks","--workspace","fixture"]).output().unwrap());
     assert_eq!(listing["tasks"].as_array().unwrap().len(),1);
     assert_eq!(std::fs::read(f.root.join("work/previous-result")).unwrap(),b"keep");
@@ -385,8 +385,15 @@ fn mcp_concurrent_background_tasks_have_live_logs_and_survive_restart() {
     assert_eq!(first["status"],"started","{first}");assert_eq!(second["status"],"started","{second}");
     let ids=[first["task_id"].as_str().unwrap().to_string(),second["task_id"].as_str().unwrap().to_string()];
     assert_ne!(ids[0],ids[1]);
-    client.call(4,"workspace_task_logs",serde_json::json!({"workspace_id":"fixture","task_id":ids[0],"max_bytes":65536}));
-    let logs=client.result();assert_eq!(logs["status"],"running","{logs}");
+    let ready=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    let logs=loop {
+        client.call(4,"workspace_task_logs",serde_json::json!({"workspace_id":"fixture","task_id":ids[0],"max_bytes":65536}));
+        let value=client.result();
+        if value["status"]=="running" && value["stdout"].as_str().is_some_and(|text|text.contains("-start"))
+            && value["stderr"].as_str().is_some_and(|text|text.contains("-stderr")) {break value;}
+        assert!(std::time::Instant::now()<ready,"{value}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     assert_eq!(logs["hostname"],"compute-fixture");assert!(logs["stdout"].as_str().unwrap().contains("-start"));
     assert!(logs["stderr"].as_str().unwrap().contains("-stderr"));
     drop(client);

@@ -32,7 +32,7 @@ MCP `workspace_run` 的 SSH/单服务器 workload 默认 `background:true`：
 rw run --workspace research --force cluster --background -- bash scripts/a.sh
 rw run --workspace research --force cluster --background -- bash scripts/b.sh
 rw tasks --workspace research
-rw tasks --workspace research --task-id <UUID> --logs --max-bytes 16384
+rw tasks --workspace research --id <UUID> --logs --max-bytes 16384
 ```
 
 CLI 默认保持前台输出，`--background` 启用后台任务；MCP 可设 `background:false` 等待输出。后台脚本和日志各自存放在远端 work 根下 `._lrworkspace_tasks/<task_id>/`，句柄保存在本机工作区元数据中。任务与日志不会因 MCP 重启或断开而自动删除。重连后重新认证即可用原句柄查询。

@@ -11,7 +11,7 @@ use std::{collections::BTreeSet, path::Path};
 use uuid::Uuid;
 
 fn key(id: Uuid) -> String {
-    format!("task-{id}")
+    format!("exec-{id}")
 }
 
 fn load(config: &LrWorkspaceConfig, workspace: &Workspace, id: Uuid) -> CoreResult<Value> {
@@ -49,7 +49,7 @@ pub fn list(config: &LrWorkspaceConfig, workspace: &Workspace, limit: usize) -> 
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("7461736b2d")
+        if !name.starts_with("657865632d")
             || !name.ends_with(".json")
             || !entry.file_type()?.is_file()
         {

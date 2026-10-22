@@ -203,7 +203,7 @@ enum Commands {
     /// List independent tasks, or query one task's live status/log tails.
     Tasks {
         #[arg(long)] workspace: Option<String>,
-        #[arg(long)] task_id: Option<uuid::Uuid>,
+        #[arg(long="id")] task_id: Option<uuid::Uuid>,
         #[arg(long)] logs: bool,
         #[arg(long, default_value_t=16384, value_parser=clap::value_parser!(u32).range(1..=65536))] max_bytes: u32,
     },
@@ -688,7 +688,7 @@ async fn run() -> CoreResult<i32> {
             let value=if let Some(id)=task_id {
                 lrworkspace_remote::tasks::poll(&app.executor,&app.config,&workspace,id,logs.then_some(max_bytes as usize)).await?
             } else {
-                if logs {return Err(CoreError::Validation("--logs requires --task-id".into()));}
+                if logs {return Err(CoreError::Validation("--logs requires --id".into()));}
                 lrworkspace_remote::tasks::list(&app.config,&workspace,20)?
             };
             println!("{}",serde_json::to_string_pretty(&value)?);

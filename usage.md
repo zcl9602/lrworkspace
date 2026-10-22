@@ -182,7 +182,7 @@ MCP `workspace_run` 默认返回独立 `task_id`，可连续或并发启动多�
 rw run --workspace research --background -- bash scripts/a.sh
 rw run --workspace research --background -- bash scripts/b.sh
 rw tasks --workspace research
-rw tasks --workspace research --task-id <UUID> --logs
+rw tasks --workspace research --id <UUID> --logs
 ```
 
 CLI 保留默认前台输出。后台任务的 SSH 启动/监控请求仍默认等待 120 秒，但任务本身不会因此被截断。独立脚本与 stdout/stderr 保存在 work 根的 `._lrworkspace_tasks/<task_id>/`，MCP 重启后仍可查询；日志读取默认每路 16 KiB、最多 64 KiB。unknown 不算成功，不应盲目重跑。
