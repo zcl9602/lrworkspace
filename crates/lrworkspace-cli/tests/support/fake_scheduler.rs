@@ -61,7 +61,21 @@ fn main() {
             writeln!(file,"{} {}",program,args.join(" ")).unwrap();
             if program=="sbatch"{println!("Submitted batch job 4242");}else{println!("4243[].server");}
         }
-        "rsync"|"scp"=>{eprintln!("test binary transport disabled; use base64 through fake SSH");std::process::exit(1);}
+        "rsync"|"scp"=>{
+            if args.iter().any(|arg|arg=="--version") { println!("rsync version 3.4.1 protocol version 32"); return; }
+            use std::io::Write;
+            let mut log=std::fs::OpenOptions::new().create(true).append(true).open(std::env::var_os("LRW_TEST_TRANSFER_LOG").unwrap()).unwrap();
+            writeln!(log,"{program}").unwrap();
+            if std::env::var_os(format!("LRW_TEST_FAIL_{}",program.to_uppercase())).is_some() { eprintln!("fixture transport unavailable"); std::process::exit(1); }
+            let path=|arg:&str| {
+                let value=if arg.contains('@') {arg.split_once(':').unwrap().1} else {arg};
+                #[cfg(windows)] let value=if value.starts_with('/') && value.as_bytes().get(2)==Some(&b'/') {format!("{}:{}", &value[1..2], &value[2..])} else {value.to_string()};
+                std::path::PathBuf::from(value)
+            };
+            let source=path(&args[args.len()-2]); let target=path(args.last().unwrap());
+            std::fs::copy(source,&target).unwrap();
+            if std::env::var_os("LRW_TEST_TRANSFER_TRUNCATED").is_some() { std::fs::write(target,b"bad").unwrap(); }
+        }
         _=>std::process::exit(2),
     }
 }

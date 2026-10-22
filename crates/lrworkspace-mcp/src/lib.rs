@@ -22,7 +22,7 @@ use lrworkspace_core::error::{CoreError, CoreResult};
 use lrworkspace_core::permission::{classify_command_risk, DefaultPolicy, RiskLevel};
 use lrworkspace_core::safety::normalize_remote_absolute;
 use lrworkspace_core::traits::{
-    AuditLogger, ClusterDetector, ProjectIndexer, RemoteExecutor, RemoteFileAccess, SlurmManager,
+    AuditLogger, ClusterDetector, ProjectIndexer, RemoteExecutor, SlurmManager,
 };
 use lrworkspace_core::types::*;
 use lrworkspace_core::workspace_store;
@@ -94,7 +94,30 @@ struct InitializeResult {
 }
 
 const MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const AGENT_INSTRUCTIONS: &str = "workspace_discover first. Cluster auto-selects compute SSH; no login workloads. Monitor task IDs. No delete/sync; local login.";
+const AGENT_INSTRUCTIONS: &str = "workspace_discover first. Cluster auto-picks compute; no login workloads. Files read/download/write; no shell base64. No delete.";
+
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { Some("image/png") }
+    else if bytes.starts_with(b"\xff\xd8\xff") { Some("image/jpeg") }
+    else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") { Some("image/gif") }
+    else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") { Some("image/webp") }
+    else { None }
+}
+
+fn tool_result(name: &str, value: Value) -> Value {
+    let mut safe = lrworkspace_core::privacy::redacted_value(value);
+    let mut content = Vec::new();
+    if name == "workspace_read_file" && safe["mime_type"].as_str().is_some_and(|mime| matches!(mime, "image/png"|"image/jpeg"|"image/gif"|"image/webp")) {
+        if let (Some(data), Some(mime)) = (safe["content"].as_str(), safe["mime_type"].as_str()) {
+            if data != lrworkspace_core::privacy::REDACTED {
+                content.push(serde_json::json!({"type":"image","mimeType":mime,"data":data}));
+            }
+        }
+        if let Some(metadata) = safe.as_object_mut() { metadata.remove("content"); metadata.remove("encoding"); }
+    }
+    content.insert(0, serde_json::json!({"type":"text","text":serde_json::to_string_pretty(&safe).unwrap_or_else(|error|error.to_string())}));
+    serde_json::json!({"content":content})
+}
 
 fn batch_options(args:&serde_json::Map<String,Value>)->CoreResult<BatchOptions> {
     match args.get("batch") {None=>Ok(BatchOptions::default()),Some(Value::Object(value))=>Ok(serde_json::from_value(Value::Object(value.clone()))?),_=>Err(CoreError::Validation("batch must be an object".into()))}
@@ -349,15 +372,7 @@ impl McpServer {
             .cloned()
             .unwrap_or_default();
         match self.call_tool(name, &args).await {
-            Ok(value) => success(
-                request,
-                serde_json::json!({
-                    "content": [{
-                        "type": "text",
-                        "text": serde_json::to_string_pretty(&lrworkspace_core::privacy::redacted_value(value)).unwrap_or_else(|error| error.to_string())
-                    }]
-                }),
-            ),
+            Ok(value) => success(request, tool_result(name, value)),
             Err(error) => JsonRpcResponse {
                 jsonrpc: "2.0".into(),
                 id: request.id.clone(),
@@ -494,31 +509,29 @@ impl McpServer {
                 let mut workspace = workspace.clone();
                 workspace.file_threshold_bytes = workspace.file_threshold_bytes
                     .min(self.config.file_threshold_bytes);
-                let bytes = self
-                    .executor
-                    .read_remote_file(&workspace, root, relative)
-                    .await?;
-                if bytes.len() as u64 > self.config.file_threshold_bytes {
-                    return Err(CoreError::Validation(format!(
-                        "Remote file is {} bytes; MCP read limit is {} bytes",
-                        bytes.len(),
-                        self.config.file_threshold_bytes
-                    )));
+                let executor = self.executor.with_timeout(request_timeout(args, self.config.ssh_timeout_secs)?);
+                let preference = TransferPreference::parse(optional_string(args, "transport").unwrap_or("auto"))?;
+                let (bytes, receipt) = executor.read_remote_file_with_transport(&workspace, root, relative, preference).await?;
+                let mut result = serde_json::json!({"root":root_label(root), "relative_path":relative,
+                    "transport":receipt.transport.as_str(), "bytes":receipt.bytes, "fallback_reasons":receipt.fallback_reasons});
+                if let Some(mime) = image_mime(&bytes) {
+                    result["mime_type"] = mime.into();
+                    result["encoding"] = "base64".into();
+                    result["content"] = lrworkspace_remote::b64::encode(&bytes).into();
+                } else {
+                    let text = String::from_utf8(bytes).map_err(|_| CoreError::Validation("Binary file: use workspace_download_file with an absolute local_path; do not run shell base64".into()))?;
+                    result["encoding"] = "utf-8".into(); result["content"] = text.into();
                 }
-                match String::from_utf8(bytes) {
-                    Ok(content) => Ok(serde_json::json!({
-                        "root": root_label(root),
-                        "relative_path": relative,
-                        "encoding": "utf-8",
-                        "content": content,
-                    })),
-                    Err(error) => Ok(serde_json::json!({
-                        "root": root_label(root),
-                        "relative_path": relative,
-                        "encoding": "base64",
-                        "content": lrworkspace_remote::b64::encode(error.as_bytes()),
-                    })),
-                }
+                Ok(result)
+            }
+            "workspace_download_file" => {
+                let root = parse_root(args)?;
+                let relative = Path::new(required_string(args, "relative_path")?);
+                let local = Path::new(required_string(args, "local_path")?);
+                let preference = TransferPreference::parse(optional_string(args, "transport").unwrap_or("auto"))?;
+                if preference == TransferPreference::Base64 { return Err(CoreError::Validation("Full downloads use auto, rsync or scp".into())); }
+                let executor = self.executor.with_timeout(request_timeout(args, self.config.ssh_timeout_secs)?);
+                Ok(serde_json::to_value(executor.download_to_local_file(&workspace, root, relative, local, preference).await?)?)
             }
             "workspace_write_file" => {
                 if args
@@ -556,6 +569,7 @@ impl McpServer {
                     "relative_path": relative,
                     "bytes": bytes,
                     "transport": method.as_str(),
+                    "fallback": preference == TransferPreference::Auto && method != lrworkspace_remote::TransferMethod::Rsync,
                 }))
             }
             "workspace_submit" => {
@@ -1415,7 +1429,9 @@ fn tool_definitions() -> Vec<ToolDefinition> {
     let rooted_path = serde_json::json!({
         "workspace_id": {"type": "string"},
         "root": {"type": "string", "description": "work or data:N", "default": "work"},
-        "relative_path": {"type": "string"}
+        "relative_path": {"type": "string"},
+        "transport": {"type":"string", "enum":["auto","rsync","scp","base64"], "default":"auto"},
+        "timeout_sec": {"type":"integer", "minimum":1, "default":120}
     });
     vec![
         tool("workspace_discover", "List registered remote workspaces and their work/data roots.", serde_json::json!({}), &[]),
@@ -1433,9 +1449,10 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         tool("workspace_env", "Refresh ~/.bin_path_file from the login-shell PATH without recursive scans or version probes, then capture the remote environment using grep.", workspace.clone(), &[]),
         tool("workspace_index", "Index root=work or data:N. On unconfirmed/submit_only nodes this lists Git tracked and unignored paths and refuses non-Git recursive scans.", serde_json::json!({"workspace_id": {"type": "string"}, "root": {"type": "string", "default": "work"}}), &[]),
         tool("workspace_search_files", "Search file names in work or data:N. On unconfirmed/submit_only nodes this lists Git tracked and unignored paths and never runs find/rg recursively.", serde_json::json!({"workspace_id": {"type": "string"}, "root": {"type": "string", "default": "work"}, "pattern": {"type": "string"}}), &["pattern"]),
-        tool("workspace_read_file", "Read a remote work/data file; no local copy is created.", rooted_path, &["relative_path"]),
-        tool("workspace_write_file", "Upload a file from the agent's own project via local_path, or supply UTF-8 content. Exactly one input is required. Writes stay under the remote work root; no local project registration. transport=rsync/scp/base64 is strict; auto may fall back. Returns the actual transport.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","enum":["work"],"default":"work"},"relative_path":{"type":"string"},"content":{"type":"string"},"local_path":{"type":"string","description":"Existing file in the agent's own local project"},"transport":{"type":"string","enum":["auto","rsync","scp","base64"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path"]),
-        tool("workspace_run", "Run independent commands under real SSH permissions. Cluster auto discovers reachable idle compute nodes and uses SSH; if none is available, submit to Slurm/PBS. execution_path=submit or batch resources force scheduler submission. Never execute workloads on the login endpoint. SSH workloads default to background=true and return a durable task_id; monitor via workspace_task_status/logs and workspace_tasks. background=false waits for output. direct is only for explicitly configured standalone servers. timeout_sec budgets SSH operations, not the lifetime of detached tasks. No automatic replay after an uncertain launch.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Optional explicit compute hostname; omitted means automatic discovery."},"execution_path":{"type":"string","enum":["auto","ssh","submit"],"default":"auto"},"background":{"type":"boolean","default":true},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"],"default":"cluster"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
+        tool("workspace_read_file", "Preview bounded UTF-8 text or PNG/JPEG/GIF/WebP images from work/data roots. Images return native MCP image content. auto tries rsync then SCP; base64 SSH is explicit only. For full/binary files use workspace_download_file, never workspace_run base64. No persistent local copy.", rooted_path, &["relative_path"]),
+        tool("workspace_download_file", "Download any file from work/data roots to a NEW absolute local_path in the agent project. Streams through rsync, falls back to SCP; no automatic base64. Never overwrites an existing file. Returns path, size, actual transport and fallback reasons, without file contents. Parent directory must exist. No project registration required.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","default":"work"},"relative_path":{"type":"string"},"local_path":{"type":"string"},"transport":{"type":"string","enum":["auto","rsync","scp"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path","local_path"]),
+        tool("workspace_write_file", "Upload a file from the agent's own project via local_path, or supply UTF-8 content. Exactly one input is required. Writes stay under the remote work root; no local project registration. transport=rsync/scp/base64 is strict; auto tries rsync then SCP without base64 fallback. Returns the actual transport.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","enum":["work"],"default":"work"},"relative_path":{"type":"string"},"content":{"type":"string"},"local_path":{"type":"string","description":"Existing file in the agent's own local project"},"transport":{"type":"string","enum":["auto","rsync","scp","base64"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path"]),
+        tool("workspace_run", "For file/image transfer use workspace_read_file/download_file/write_file; do not run base64 to move files. Run independent commands under real SSH permissions. Cluster auto discovers reachable idle compute nodes and uses SSH; if none is available, submit to Slurm/PBS. execution_path=submit or batch resources force scheduler submission. Never execute workloads on the login endpoint. SSH workloads default to background=true and return a durable task_id; monitor via workspace_task_status/logs and workspace_tasks. background=false waits for output. direct is only for explicitly configured standalone servers. timeout_sec budgets SSH operations, not the lifetime of detached tasks. No automatic replay after an uncertain launch.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Optional explicit compute hostname; omitted means automatic discovery."},"execution_path":{"type":"string","enum":["auto","ssh","submit"],"default":"auto"},"background":{"type":"boolean","default":true},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"],"default":"cluster"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
         tool("workspace_tasks", "List independent SSH task handles in this workspace without contacting a server. Returned states are last observations; query task_id for live state. Never deletes tasks or logs.", serde_json::json!({"workspace_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}}), &[]),
         tool("workspace_task_status", "Read one SSH task's live state, exit code and actual hostname without waiting for other commands. Unknown is not success. Handles survive MCP restart.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_task_logs", "Read independent bounded stdout/stderr tails and live task state. Output is read on the recorded compute node; empty output is not completion evidence.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
@@ -1615,6 +1632,20 @@ mod tests {
         }
         let _=std::fs::remove_dir_all(root);
     }
+    #[test]
+    fn native_images_do_not_duplicate_base64_into_text_and_keep_redaction() {
+        let bytes=b"\xff\xd8\xffsynthetic JPEG";
+        assert_eq!(image_mime(bytes),Some("image/jpeg"));
+        let encoded=lrworkspace_remote::b64::encode(bytes);
+        let value=serde_json::json!({"mime_type":"image/jpeg","encoding":"base64","content":encoded});
+        let result=tool_result("workspace_read_file",value.clone());
+        assert_eq!(result["content"][1]["data"],encoded);
+        assert!(!result["content"][0]["text"].as_str().unwrap().contains(&encoded));
+        let _secret=lrworkspace_core::privacy::SensitiveString::new(encoded);
+        let safe=tool_result("workspace_read_file",value);
+        assert_eq!(safe["content"].as_array().unwrap().len(),1);
+    }
+
     #[test]
     fn model_payloads_errors_and_diagnostic_journals_suppress_known_credentials() {
         let secret=lrworkspace_core::privacy::SensitiveString::new("model-output-canary-3451".into());

@@ -12,7 +12,7 @@ use lrworkspace_core::config::LrWorkspaceConfig;
 use lrworkspace_core::error::{CoreError, CoreResult};
 use lrworkspace_core::permission::{classify_command_risk, DefaultPolicy, RiskLevel};
 use lrworkspace_core::traits::{
-    AuditLogger, ClusterDetector, ProjectIndexer, RemoteExecutor, RemoteFileAccess, SlurmManager,
+    AuditLogger, ClusterDetector, ProjectIndexer, RemoteExecutor, SlurmManager,
 };
 use lrworkspace_core::types::*;
 use lrworkspace_core::workspace_store;
@@ -150,14 +150,20 @@ enum Commands {
         #[arg(long, default_value = "work")]
         root: String,
     },
-    /// Read a file directly from a remote work or data root.
+    /// Preview a bounded remote UTF-8 text file; use download for binary files.
     Read {
-        #[arg(long)]
-        workspace: Option<String>,
-        #[arg(long, default_value = "work")]
-        root: String,
-        #[arg(long)]
-        file: PathBuf,
+        #[arg(long)] workspace: Option<String>,
+        #[arg(long, default_value = "work")] root: String,
+        #[arg(long)] file: PathBuf,
+        #[arg(long, default_value="auto", value_parser=["auto", "rsync", "scp", "base64"])] transport: String,
+    },
+    /// Stream a remote file to a NEW local file without loading it into memory.
+    Download {
+        #[arg(long)] workspace: Option<String>,
+        #[arg(long, default_value = "work")] root: String,
+        #[arg(long)] file: PathBuf,
+        #[arg(long)] to: PathBuf,
+        #[arg(long, default_value="auto", value_parser=["auto", "rsync", "scp"])] transport: String,
     },
     /// Write a file directly under remote_work_dir.
     Write {
@@ -564,28 +570,18 @@ async fn run() -> CoreResult<i32> {
                 .await?;
             println!("{}", serde_json::to_string_pretty(&index)?);
         }
-        Commands::Read {
-            workspace,
-            root,
-            file,
-        } => {
+        Commands::Read { workspace, root, file, transport } => {
             let mut workspace = app.workspace(workspace.as_deref())?;
-            workspace.file_threshold_bytes = workspace.file_threshold_bytes
-                .min(app.config.file_threshold_bytes);
-            let bytes = app
-                .executor
-                .read_remote_file(&workspace, parse_root(&root)?, &file)
-                .await?;
-            if bytes.len() as u64 > app.config.file_threshold_bytes {
-                return Err(CoreError::Validation(format!(
-                    "File exceeds read limit: {} bytes",
-                    bytes.len()
-                )));
-            }
-            match String::from_utf8(bytes) {
-                Ok(text) => print!("{text}"),
-                Err(error) => println!("{}", lrworkspace_remote::b64::encode(error.as_bytes())),
-            }
+            workspace.file_threshold_bytes = workspace.file_threshold_bytes.min(app.config.file_threshold_bytes);
+            let (bytes, receipt) = app.executor.read_remote_file_with_transport(&workspace, parse_root(&root)?, &file, TransferPreference::parse(&transport)?).await?;
+            let text = String::from_utf8(bytes).map_err(|_| CoreError::Validation("Binary file: use rw download --file <remote> --to <absolute-local-path>".into()))?;
+            eprintln!("transport={}", receipt.transport.as_str());
+            print!("{text}");
+        }
+        Commands::Download { workspace, root, file, to, transport } => {
+            let workspace = app.workspace(workspace.as_deref())?;
+            let receipt = app.executor.download_to_local_file(&workspace, parse_root(&root)?, &file, &to, TransferPreference::parse(&transport)?).await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
         }
         Commands::Write {
             workspace,

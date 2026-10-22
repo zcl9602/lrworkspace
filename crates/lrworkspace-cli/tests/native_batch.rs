@@ -44,6 +44,7 @@ impl Fixture {
         #[cfg(windows)] paths.push(PathBuf::from(r"C:\Program Files\Git\usr\bin"));
         if let Some(path)=std::env::var_os("PATH"){paths.extend(std::env::split_paths(&path));}
         command.env("PATH",std::env::join_paths(paths).unwrap())
+            .env("LRW_TEST_TRANSFER_LOG",self.root.join("transfers.log"))
             .env("LRWORKSPACE_SSH",self.root.join("bin").join(if cfg!(windows){"ssh.exe"}else{"ssh"})).env("LRWORKSPACE_SCP",self.root.join("bin").join(if cfg!(windows){"scp.exe"}else{"scp"}))
             .env("LRWORKSPACE_CONFIG",self.root.join("config.toml")).env("LRWORKSPACE_DATA_DIR",&self.config.data_dir)
             .env("LRWORKSPACE_RSYNC",self.root.join("bin").join(if cfg!(windows){"rsync.exe"}else{"rsync"}))
@@ -419,4 +420,70 @@ fn mcp_concurrent_background_tasks_have_live_logs_and_survive_restart() {
     assert_eq!(outcomes[1]["status"],"failed");assert_eq!(outcomes[1]["exit_code"],9);
     assert!(!f.root.join("submissions.log").exists(),"automatic SSH must not also submit a duplicate job");
     assert_eq!(std::fs::read(f.root.join("work/previous-result")).unwrap(),b"keep");
+}
+
+#[test]
+fn file_download_prefers_rsync_reports_scp_and_never_clobbers() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let bytes:Vec<u8>=(0..=255).cycle().take(65536).collect();
+    std::fs::write(f.root.join("work/binary ' 中文.bin"),&bytes).unwrap();
+    let remote="binary ' 中文.bin";
+    let first=f.root.join("first ' 中文.bin");
+    let receipt=success(f.command().args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&first).output().unwrap());
+    assert_eq!(receipt["transport"],"rsync"); assert_eq!(std::fs::read(&first).unwrap(),bytes);
+    let second=f.root.join("second.bin");
+    let receipt=success(f.command().env("LRW_TEST_FAIL_RSYNC","1").args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&second).output().unwrap());
+    assert_eq!(receipt["transport"],"scp"); assert_eq!(receipt["fallback_reasons"].as_array().unwrap().len(),1);
+    assert_eq!(std::fs::read(second).unwrap(),bytes);
+    let output=f.command().args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&first).output().unwrap();
+    assert!(!output.status.success()); assert_eq!(std::fs::read(first).unwrap(),bytes);
+    for strict in [false,true] {
+        let target=f.root.join(if strict {"strict.bin"}else{"failed.bin"});
+        let mut command=f.command();command.env("LRW_TEST_FAIL_RSYNC","1").env("LRW_TEST_FAIL_SCP","1").args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&target);
+        if strict {command.args(["--transport","rsync"]);}
+        assert!(!command.output().unwrap().status.success()); assert!(!target.exists());
+    }
+    let target=f.root.join("partial.bin");
+    assert!(!f.command().env("LRW_TEST_TRANSFER_TRUNCATED","1").args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&target).output().unwrap().status.success());
+    assert!(!target.exists());
+    let shared=f.root.join("concurrent.bin");
+    let mut children=Vec::new();
+    for _ in 0..2 {children.push(f.command().args(["download","--workspace","fixture","--file",remote,"--to"]).arg(&shared).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());}
+    assert_eq!(children.into_iter().filter_map(|mut child|child.wait().ok()).filter(|status|status.success()).count(),1);
+    assert_eq!(std::fs::read(shared).unwrap(),bytes);
+    std::fs::write(f.root.join("work/large.txt"),vec![b'x';1048577]).unwrap();
+    assert!(!f.command().args(["read","--workspace","fixture","--file","large.txt"]).output().unwrap().status.success());
+    let full=f.root.join("large.txt");
+    let receipt=success(f.command().args(["download","--workspace","fixture","--file","large.txt","--to"]).arg(&full).output().unwrap());
+    assert_eq!(receipt["bytes"],1048577);
+    assert!(!f.command().args(["read","--workspace","fixture","--file",remote]).output().unwrap().status.success());
+    assert!(!f.command().args(["write","--workspace","fixture","--file","keep.txt","--content","new"]).env("LRW_TEST_FAIL_RSYNC","1").env("LRW_TEST_FAIL_SCP","1").output().unwrap().status.success());
+    assert!(!f.root.join("work/keep.txt").exists());
+}
+
+#[test]
+#[ignore="requires matching MCP binary; local synthetic transports only"]
+fn mcp_file_images_and_downloads_use_binary_transport() {
+    use std::io::Write; use std::process::Stdio;
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let bytes=b"\x89PNG\r\n\x1a\nsynthetic preview";
+    std::fs::write(f.root.join("work/image.png"),bytes).unwrap();
+    let exe=Path::new(env!("CARGO_BIN_EXE_rw")).parent().unwrap().join(if cfg!(windows){"lrworkspace-mcp.exe"}else{"lrworkspace-mcp"});
+    let mut child=f.command_for(&exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut input=child.stdin.take().unwrap();
+    let destination=f.root.join("image-local.png");
+    for request in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"file-test"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_read_file","arguments":{"workspace_id":"fixture","relative_path":"image.png"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_download_file","arguments":{"workspace_id":"fixture","relative_path":"image.png","local_path":destination}}}),
+    ] {writeln!(input,"{request}").unwrap();}
+    drop(input); let output=child.wait_with_output().unwrap(); assert!(output.status.success());
+    let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();responses.sort_by_key(|v|v["id"].as_u64());
+    for response in &responses {assert!(response.get("error").is_none(),"{response}");}
+    let preview=&responses[1]["result"]["content"];
+    assert_eq!(preview[1]["type"],"image"); assert_eq!(preview[1]["mimeType"],"image/png");
+    assert_eq!(lrworkspace_remote::b64::decode(preview[1]["data"].as_str().unwrap()).unwrap(),bytes);
+    let metadata:serde_json::Value=serde_json::from_str(preview[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(metadata["transport"],"rsync"); assert!(metadata.get("content").is_none());
+    assert_eq!(std::fs::read(destination).unwrap(),bytes);
 }

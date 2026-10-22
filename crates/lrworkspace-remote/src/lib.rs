@@ -44,7 +44,7 @@ pub mod tasks;
 
 pub use cluster::ClusterDetectorImpl;
 pub use executor::RemoteExecutorImpl;
-pub use file_transfer::{TransferMethod, TransferPreference};
+pub use file_transfer::{DownloadReceipt, TransferMethod, TransferPreference};
 pub use indexer::ProjectIndexerImpl;
 pub use openssh::{ensure_openssh_client, openssh_client_available};
 pub use ssh_config::SshConfig;

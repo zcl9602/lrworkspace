@@ -1,6 +1,6 @@
 # Local Remote Workspace（LRW）
 
-LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.6.0**。
+LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.6.1**。
 
 ```text
 agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data 根
@@ -31,7 +31,7 @@ rw submit --workspace <UUID或名称> --in commands.sh --outdir JOBS --cpu 1 --m
 
 `rw submit` 不加 `--submit` 只生成；`run --execution-path submit` 和带 batch 资源的 `workspace_run` 提交单命令分组，`workspace_submit` 接收命令列表。每次使用新 run 目录，保留旧脚本和日志。详见 [统一提交模式](docs/batch-submit.md)。
 
-默认命令/传输等待为 **120 秒**，CLI 用 `--timeout-secs`，MCP run/write/submit/wait 用 `timeout_sec` 覆盖。排队任务的作业时限由调度器控制，和本机请求超时是两个概念。
+默认命令/传输等待为 **120 秒**，CLI 用 `--timeout-secs`，MCP run/read/download/write/submit/wait 用 `timeout_sec` 覆盖。排队任务的作业时限由调度器控制，和本机请求超时是两个概念。
 
 ```text
 # 明确允许 SSH 到 compute01，跳过调度器
@@ -46,14 +46,24 @@ rw run --workspace research --force cluster --compute-node compute01 --timeout-s
 
 0.3.3 经旧版 PBS 集群实机验收修复了 Windows rsync 代理 shell 和旧 Torque 日志路径；PBS 只有一个命令组时使用普通作业，仍保留相同分组脚本和状态记录。该站点的数组启动器存在 zsh 方括号解析错误，多元素数组尚未通过。详见 [匿名化集群验收记录](docs/maintenance-2026-10-19-proxy-pbs.md)。
 
-## 上传
+## 文件读取与传输
+
+0.6.1 将小文件读取和完整下载都接入 rsync → SCP；两个后端都失败就报错。`workspace_read_file` 预览 UTF-8 文本或 PNG/JPEG/GIF/WebP 图片，图片以原生 MCP 图片内容返回，不把编码串作为文本输出。MCP 图片协议自身仍需要 base64 编码，这与 SSH 传输方式无关。其它二进制或大文件使用 `workspace_download_file`，不要通过 `workspace_run base64 ...` 下载。
+
+```text
+rw download --workspace research --file results/plot.png --to <本机绝对路径>
+```
+
+MCP 下载参数：`relative_path`、`local_path`（绝对路径），可选 `root=work|data:N`、`transport=auto|rsync|scp`、`timeout_sec`。下载流式写入磁盘，返回路径、大小、实际后端和回退原因，不返回文件内容；本地父目录须存在，目标须为新文件，失败保留已有文件。read/write 保留显式 `transport=base64` 作为有界兼容选项。
+
+### 上传
 
 ```text
 rw write --workspace <UUID或名称> --file scripts/run.sh --from ./run.sh --transport rsync --timeout-secs 300
 rw run --workspace <UUID或名称> --force cluster -- bash scripts/run.sh
 ```
 
-`auto` 可从 rsync 回退到 scp/base64；显式指定 `rsync`/`scp`/`base64` 时失败即报错，返回实际使用的传输方式。上传先准备目标父目录和独占临时目录，传输后核对大小，再替换目标。
+`auto` 优先 rsync，失败回退到 SCP，不再自动使用 base64；显式指定 `rsync`/`scp`/`base64` 时失败即报错，返回实际使用的传输方式。上传先准备目标父目录和独占临时目录，传输后核对大小，再替换目标。
 
 **文件 API 有 work/data 根边界；命令没有 OS 级只读沙箱。** 所有命令仍按 SSH 账户真实权限运行。未查到作业或日志不代表成功，需核对明确终态和实际输出。
 
@@ -73,3 +83,5 @@ Windows 产物为原生 `.exe`；Linux/macOS 使用同一数据模型。运行�
 - [架构与边界](docs/architecture.md)：模块和数据流。
 - [开发与验收](docs/development.md)：本地测试及真实服务器验收。
 - [0.3.0 维护记录](docs/maintenance-2026-10-15-native-arrays.md)：本轮实现、验证和限制。
+
+本机固定的 2 个 Tokio 线程负责异步 I/O，不代表只能运行 2 条命令。阻塞传输使用独立工作池；MCP 同时接受最多 16 个执行/文件请求，另保留 16 个状态/控制请求。后台任务启动后不占请求槽位，可持续运行更多远端进程，实际数量取决于服务器资源和调度规则。

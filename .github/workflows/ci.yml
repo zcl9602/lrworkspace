@@ -57,6 +57,8 @@ jobs:
         run: cargo test -p lrworkspace-cli --test native_batch mcp_concurrent --locked -- --ignored --nocapture
       - name: Run MCP bounded-output session regression
         run: cargo test -p lrworkspace-cli --test native_batch mcp_truncated --locked -- --ignored --nocapture
+      - name: Verify binary file transfers and native MCP images
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_file_images --locked -- --ignored --nocapture
       - name: Test clean user installation and minimal PATH
         run: cargo test -p lrworkspace-cli --test portable installing_from_unicode --locked -- --ignored --nocapture
       - name: Verify native OpenSSH private password authentication

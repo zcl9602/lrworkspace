@@ -1,16 +1,7 @@
-//! Remote file transfer — rsync/scp first, base64+exec fallback.
-//!
-//! CLI/MCP reads use bounded SSH output and enforce the workspace file limit
-//! before and during transfer. Uploads and explicit full downloads use:
-//! 1. **`rsync`** when the local client provides it (incremental, works with ProxyJump)
-//! 2. **OpenSSH `scp`** (ControlMaster on Unix; plain scp on Windows)
-//! 3. **ssh2 SFTP** on non-Windows hosts (direct TCP, no jump/proxy)
-//! 4. **base64 over SSH exec** (always available when `execute` works)
+//! Remote file transfer — rsync first, SCP fallback, base64 only by explicit request.
+//! Reads are bounded; full downloads stream to a new local file. All blocking
+//! subprocess waits run outside the asynchronous I/O workers.
 
-#[cfg(unix)]
-use std::io::IsTerminal;
-#[cfg(not(windows))]
-use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::process;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 use lrworkspace_core::error::{CoreError, CoreResult};
@@ -27,11 +18,7 @@ use lrworkspace_core::traits::RemoteFileAccess;
 use lrworkspace_core::types::{AuthMethod, ConnectionConfig, RemoteRootKind, Workspace};
 
 use crate::b64;
-#[cfg(unix)]
-use crate::executor::ensure_ssh_master;
-#[cfg(not(windows))]
-use crate::executor::open_ssh2_session;
-use crate::executor::{system_ssh_available, RemoteExecutorImpl};
+use crate::executor::RemoteExecutorImpl;
 #[cfg(not(windows))]
 use crate::ssh_config::control_path_for_connection;
 
@@ -60,6 +47,33 @@ impl TransferMethod {
     pub fn as_str(self) -> &'static str {
         match self { Self::Rsync => "rsync", Self::SystemScp => "scp", Self::Ssh2Sftp => "sftp", Self::Base64Exec => "base64" }
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DownloadReceipt {
+    #[serde(serialize_with = "serialize_transport")]
+    pub transport: TransferMethod,
+    pub bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<PathBuf>,
+    pub fallback_reasons: Vec<String>,
+}
+fn serialize_transport<S: serde::Serializer>(method: &TransferMethod, serializer: S) -> Result<S::Ok, S::Error> { serializer.serialize_str(method.as_str()) }
+
+struct DownloadTemporary(PathBuf);
+impl DownloadTemporary {
+    fn new(parent: &Path) -> CoreResult<Self> {
+        let path = parent.join(format!(".lrw-download-{}", Uuid::new_v4()));
+        #[allow(unused_mut)]
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+    fn payload(&self) -> PathBuf { self.0.join("payload") }
+}
+impl Drop for DownloadTemporary {
+    fn drop(&mut self) { let _ = std::fs::remove_file(self.payload()); let _ = std::fs::remove_dir(&self.0); }
 }
 
 struct LocalTemporary(PathBuf);
@@ -155,43 +169,14 @@ fn finalize_upload_command(staging: &Path, target: &str, size: u64) -> CoreResul
         source=shell_quote(&normalize_remote_absolute(staging)?), target=shell_quote(target)))
 }
 
-fn try_system_scp_download(
-    config: &ConnectionConfig,
-    remote_abs: &Path,
-    timeout: Duration,
-) -> CoreResult<Vec<u8>> {
-    let config = config.clone();
-    let remote_abs = remote_abs.to_path_buf();
-    let local_tmp = temp_transfer_path("dl");
-
-    let target = resolve_openssh_target(&config);
-    #[cfg(unix)]
-    {
-        let interactive = std::io::stdin().is_terminal();
-        ensure_ssh_master(
-            &config,
-            &target.user,
-            target.port,
-            &target.control_path,
-            timeout,
-            interactive,
-        )?;
-    }
-
-    let remote_spec = scp_remote_spec(&target, &remote_abs)?;
-    let mut cmd = crate::openssh::scp_command_for(&config);
-    apply_openssh_options(&mut cmd, &config, &target, timeout)?;
-    append_port_flag(&mut cmd, &target, true);
-    cmd.arg(&remote_spec).arg(&local_tmp);
-
-    let result = process::checked(&mut cmd, timeout, "scp download");
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&local_tmp);
-        return Err(error);
-    }
-    let bytes = std::fs::read(&local_tmp).map_err(CoreError::from)?;
-    let _ = std::fs::remove_file(&local_tmp);
-    Ok(bytes)
+fn try_system_scp_download(config: &ConnectionConfig, remote_abs: &Path, local: &Path, timeout: Duration) -> CoreResult<()> {
+    let target = resolve_openssh_target(config);
+    let mut command = crate::openssh::scp_command_for(config);
+    apply_openssh_options(&mut command, config, &target, timeout)?;
+    append_port_flag(&mut command, &target, true);
+    command.arg("--").arg(scp_remote_spec(&target, remote_abs)?).arg(local);
+    process::checked(&mut command, timeout, "scp download")?;
+    Ok(())
 }
 
 fn try_system_scp_upload(config: &ConnectionConfig, remote_abs: &Path, local_path: &Path, timeout: Duration) -> CoreResult<()> {
@@ -204,7 +189,6 @@ fn try_system_scp_upload(config: &ConnectionConfig, remote_abs: &Path, local_pat
     Ok(())
 }
 
-fn rsync_available()->bool {ensure_rsync_compatible(Duration::from_secs(5)).is_ok()}
 
 fn parse_rsync_major(text:&str)->Option<u32> {
     text.lines().find_map(|line|line.split_once("version ").and_then(|(_,tail)|tail.split('.').next()?.trim().parse().ok()))
@@ -291,6 +275,10 @@ fn rsync_remote_spec(target: &OpenSshTarget, path: &str) -> String {
 /// Use a relative local operand from its own directory: a Windows drive colon
 /// otherwise makes rsync interpret BOTH operands as remote hosts.
 fn rsync_command(config: &ConnectionConfig, remote: &Path, local: &Path, timeout: Duration, upload: bool) -> CoreResult<Command> {
+    rsync_command_limited(config, remote, local, timeout, upload, None)
+}
+
+fn rsync_command_limited(config: &ConnectionConfig, remote: &Path, local: &Path, timeout: Duration, upload: bool, limit: Option<u64>) -> CoreResult<Command> {
     let remote = normalize_remote_absolute(remote)?;
     let parent = local.parent().ok_or_else(|| CoreError::Validation("Local file has no parent directory".into()))?;
     let name = local.file_name().ok_or_else(|| CoreError::Validation("Local file has no name".into()))?;
@@ -309,6 +297,7 @@ fn rsync_command(config: &ConnectionConfig, remote: &Path, local: &Path, timeout
             if let Ok(path) = std::env::join_paths(paths) { command.env("PATH", path); }
         }
     }
+    if let Some(limit) = limit { command.arg(format!("--max-size={limit}")); }
     command.current_dir(parent).args(["-tzs", "--blocking-io", "--partial", "--checksum", "--no-perms", "--no-owner", "--no-group"])
         .arg(format!("--timeout={}", timeout.as_secs().max(1)))
         .arg("-e").arg(rsync_ssh_command(config, &target, timeout)?).arg("--");
@@ -362,18 +351,14 @@ fn rsync_ssh_command_with_config(config:&ConnectionConfig,target:&OpenSshTarget,
     parts.iter().map(|part| rsync_quote(part)).collect::<Vec<_>>().join(" ")
 }
 
-fn try_rsync_download(
-    config: &ConnectionConfig,
-    remote_abs: &Path,
-    timeout: Duration,
-) -> CoreResult<Vec<u8>> {
-    if !rsync_available() {
-        return Err(CoreError::Connection("rsync is not installed locally".into()));
-    }
-    let local_tmp = LocalTemporary(temp_transfer_path("dl"));
-    let mut command = rsync_command(config, remote_abs, &local_tmp.0, timeout, false)?;
-    process::checked(&mut command, timeout, "rsync download")?;
-    Ok(std::fs::read(&local_tmp.0)?)
+fn try_rsync_download(config: &ConnectionConfig, remote_abs: &Path, local: &Path, timeout: Duration, limit: Option<u64>) -> CoreResult<()> {
+    let started = Instant::now();
+    ensure_rsync_compatible(timeout)?;
+    let budget = timeout.checked_sub(started.elapsed()).filter(|d| !d.is_zero())
+        .ok_or_else(|| CoreError::Timeout("rsync version check exhausted transfer budget".into()))?;
+    let mut command = rsync_command_limited(config, remote_abs, local, budget, false, limit)?;
+    process::checked(&mut command, budget, "rsync download")?;
+    Ok(())
 }
 
 fn try_rsync_upload(config: &ConnectionConfig, remote_abs: &Path, local_path: &Path, timeout: Duration) -> CoreResult<()> {
@@ -382,42 +367,6 @@ fn try_rsync_upload(config: &ConnectionConfig, remote_abs: &Path, local_path: &P
     let mut command = rsync_command(config, remote_abs, local_path, timeout, true)?;
     process::checked(&mut command, timeout, "rsync upload")?;
     Ok(())
-}
-
-#[cfg(not(windows))]
-fn ssh2_sftp_download(session: ssh2::Session, remote_abs: PathBuf) -> CoreResult<Vec<u8>> {
-    let sftp = session
-        .sftp()
-        .map_err(|e| CoreError::Connection(format!("sftp subsystem unavailable: {e}")))?;
-    let remote_str = remote_abs.to_string_lossy().to_string();
-    let mut file = sftp
-        .open(Path::new(&remote_str))
-        .map_err(|e| CoreError::Connection(format!("sftp open failed: {e}")))?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| CoreError::Connection(format!("sftp read failed: {e}")))?;
-    Ok(buf)
-}
-
-async fn download_via_base64_exec(
-    executor: &RemoteExecutorImpl,
-    workspace: &Workspace,
-    remote_abs: &Path,
-) -> CoreResult<Vec<u8>> {
-    let path_str = normalize_remote_absolute(remote_abs)?;
-    let cmd = format!("base64 -- {}", shell_quote(&path_str));
-    let record = executor
-        .execute_control(workspace, &cmd, None, &Default::default())
-        .await?;
-    if record.exit_code != Some(0) {
-        return Err(CoreError::NotFound(format!(
-            "base64 download failed for {}: {}",
-            path_str, record.stderr
-        )));
-    }
-    if record.output_truncated { return Err(CoreError::InvalidState("Full download output was truncated; use a binary transport".into())); }
-    b64::decode(record.stdout.trim())
-        .map_err(|e| CoreError::InvalidState(format!("corrupt base64 for {path_str}: {e}")))
 }
 
 async fn upload_via_base64_exec(
@@ -511,80 +460,81 @@ fn decode_bounded_read(output: &str, limit: u64) -> CoreResult<Vec<u8>> {
 }
 
 impl RemoteExecutorImpl {
-    /// Download a remote file from the selected work/data root.
-    ///
-    /// This explicit full-download API does not impose the small-file read
-    /// limit. CLI/MCP callers use `RemoteFileAccess::read_remote_file` instead.
-    ///
-    /// Tries rsync → OpenSSH scp → ssh2 SFTP → base64 exec.
-    pub async fn download_remote_file(
-        &self,
-        workspace: &Workspace,
-        root_kind: RemoteRootKind,
-        relative_path: &Path,
-    ) -> CoreResult<(Vec<u8>, TransferMethod)> {
-        let remote_abs = self
-            .validate_mcp_read_target(workspace, root_kind, relative_path)
-            .await?;
-        let rel_display = relative_path.display().to_string();
+    /// Download directly to a new file in the agent's project; never overwrite an existing path.
+    pub async fn download_to_local_file(&self, workspace: &Workspace, root: RemoteRootKind, relative: &Path, local: &Path, preference: TransferPreference) -> CoreResult<DownloadReceipt> {
+        if !local.is_absolute() { return Err(CoreError::Validation("local_path must be absolute".into())); }
+        if std::fs::symlink_metadata(local).is_ok() { return Err(CoreError::Validation("Download destination already exists; choose a new local_path".into())); }
+        let parent = local.parent().ok_or_else(|| CoreError::Validation("Missing destination parent".into()))?;
+        let parent = std::fs::canonicalize(parent)?;
+        let destination = parent.join(local.file_name().ok_or_else(|| CoreError::Validation("Missing file name".into()))?);
+        let temporary = DownloadTemporary::new(&parent)?;
+        let mut receipt = self.transfer_download(workspace, root, relative, &temporary.payload(), preference, None).await?;
+        // Atomic create without clobbering a file created by another concurrent caller.
+        std::fs::hard_link(temporary.payload(), &destination)?;
+        receipt.local_path = Some(destination);
+        Ok(receipt)
+    }
 
+    /// Bounded preview. Binary data is never returned as shell stdout unless explicitly requested.
+    pub async fn read_remote_file_with_transport(&self, workspace: &Workspace, root: RemoteRootKind, relative: &Path, preference: TransferPreference) -> CoreResult<(Vec<u8>, DownloadReceipt)> {
+        let temporary = DownloadTemporary::new(&std::env::temp_dir())?;
+        let receipt = self.transfer_download(workspace, root, relative, &temporary.payload(), preference, Some(workspace.file_threshold_bytes)).await?;
+        let path = temporary.payload();
+        let limit = workspace.file_threshold_bytes;
+        let bytes = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let file = std::fs::File::open(path)?;
+            let mut bytes = Vec::new();
+            file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > limit { return Err(CoreError::Validation("File grew beyond preview limit".into())); }
+            Ok(bytes)
+        }).await.map_err(|e| CoreError::Connection(format!("Preview worker failed: {e}")))??;
+        Ok((bytes, receipt))
+    }
 
-        if system_ssh_available() {
-            match try_rsync_download(&workspace.connection, &remote_abs, self.timeout()) {
-                Ok(bytes) => {
-                    debug!(method = "rsync", path = %rel_display, size = bytes.len(), "download ok");
-                    return Ok((bytes, TransferMethod::Rsync));
+    /// Compatibility API: bounded by the workspace preview limit; large files should stream to disk.
+    pub async fn download_remote_file(&self, workspace: &Workspace, root: RemoteRootKind, relative: &Path) -> CoreResult<(Vec<u8>, TransferMethod)> {
+        let (bytes, receipt) = self.read_remote_file_with_transport(workspace, root, relative, TransferPreference::Auto).await?;
+        Ok((bytes, receipt.transport))
+    }
+
+    async fn transfer_download(&self, workspace: &Workspace, root: RemoteRootKind, relative: &Path, local: &Path, preference: TransferPreference, limit: Option<u64>) -> CoreResult<DownloadReceipt> {
+        let started = Instant::now();
+        let remaining = || self.timeout().checked_sub(started.elapsed()).filter(|d| !d.is_zero())
+            .ok_or_else(|| CoreError::Timeout("File download exceeded its timeout budget".into()));
+        let remote = self.with_timeout(remaining()?).validate_mcp_read_target(workspace, root, relative).await?;
+        let stat = format!("[ -f {path} ] || exit 23; stat -Lc '%s' -- {path}", path=shell_quote(&normalize_remote_absolute(&remote)?));
+        let record = self.with_timeout(remaining()?).execute_control(workspace, &stat, None, &Default::default()).await?;
+        if record.exit_code != Some(0) { return Err(CoreError::Validation("Download source must be a readable regular file".into())); }
+        let expected = record.stdout.trim().parse::<u64>().map_err(|_| CoreError::InvalidState("Invalid remote file size".into()))?;
+        if limit.is_some_and(|limit| expected > limit) { return Err(CoreError::Validation("Remote file exceeds preview limit; use workspace_download_file or rw download".into())); }
+        let mut fallbacks = Vec::new();
+        for method in [TransferMethod::Rsync, TransferMethod::SystemScp, TransferMethod::Base64Exec] {
+            if !matches!((preference, method), (TransferPreference::Auto, TransferMethod::Rsync | TransferMethod::SystemScp) | (TransferPreference::Rsync, TransferMethod::Rsync) | (TransferPreference::Scp, TransferMethod::SystemScp) | (TransferPreference::Base64, TransferMethod::Base64Exec)) { continue; }
+            let result = if method == TransferMethod::Base64Exec {
+                let cap = limit.unwrap_or(16 * 1024 * 1024).min(16 * 1024 * 1024);
+                if expected > cap { return Err(CoreError::Validation("Explicit base64 read is limited to 16 MiB; use rsync/scp".into())); }
+                let record = self.with_timeout(remaining()?).execute_control(workspace, &bounded_read_command(&remote, cap)?, None, &Default::default()).await?;
+                if record.exit_code != Some(0) || record.output_truncated { Err(CoreError::Connection("Bounded base64 read failed or was truncated".into())) }
+                else { std::fs::write(local, decode_bounded_read(&record.stdout, cap)?).map_err(CoreError::from) }
+            } else {
+                let config = workspace.connection.clone(); let remote = remote.clone(); let local = local.to_path_buf(); let budget = remaining()?;
+                tokio::task::spawn_blocking(move || match method {
+                    TransferMethod::Rsync => try_rsync_download(&config, &remote, &local, budget, limit),
+                    _ => try_system_scp_download(&config, &remote, &local, budget),
+                }).await.map_err(|e| CoreError::Connection(format!("Download worker failed: {e}")))?
+            };
+            match result {
+                Ok(()) => {
+                    let bytes = std::fs::metadata(local)?.len();
+                    if bytes != expected || limit.is_some_and(|limit| bytes > limit) { return Err(CoreError::InvalidState("Remote file changed size during transfer; destination was not created".into())); }
+                    return Ok(DownloadReceipt { transport: method, bytes, local_path: None, fallback_reasons: fallbacks });
                 }
-                Err(e) => warn!(
-                    path = %rel_display,
-                    error = %e,
-                    "rsync download failed, trying scp"
-                ),
-            }
-            match try_system_scp_download(&workspace.connection, &remote_abs, self.timeout()) {
-                Ok(bytes) => {
-                    debug!(method = "system-scp", path = %rel_display, size = bytes.len(), "download ok");
-                    return Ok((bytes, TransferMethod::SystemScp));
-                }
-                Err(e) => warn!(
-                    path = %rel_display,
-                    error = %e,
-                    "system scp download failed, trying SFTP"
-                ),
+                Err(error) if preference != TransferPreference::Auto => return Err(error),
+                Err(error) => { fallbacks.push(format!("{}: {error}", method.as_str())); }
             }
         }
-
-        #[cfg(not(windows))]
-        if let Ok(session) = open_ssh2_session(&workspace.connection, self.timeout()).await {
-            let remote_abs_clone = remote_abs.clone();
-            match tokio::task::spawn_blocking(move || ssh2_sftp_download(session, remote_abs_clone))
-                .await
-            {
-                Ok(Ok(bytes)) => {
-                    debug!(method = "ssh2-sftp", path = %rel_display, size = bytes.len(), "download ok");
-                    return Ok((bytes, TransferMethod::Ssh2Sftp));
-                }
-                Ok(Err(e)) => warn!(
-                    path = %rel_display,
-                    error = %e,
-                    "ssh2 SFTP download failed, falling back to base64 exec"
-                ),
-                Err(e) => warn!(
-                    path = %rel_display,
-                    error = %e,
-                    "ssh2 SFTP download task failed, falling back to base64 exec"
-                ),
-            }
-        } else {
-            warn!(
-                path = %rel_display,
-                "ssh2 session unavailable (proxy/jump host?), skipping SFTP"
-            );
-        }
-
-        let bytes = download_via_base64_exec(self, workspace, &remote_abs).await?;
-        debug!(method = "base64-exec", path = %rel_display, size = bytes.len(), "download ok");
-        Ok((bytes, TransferMethod::Base64Exec))
+        Err(CoreError::Connection(format!("Binary download failed; no automatic base64 fallback. {}", fallbacks.join("; "))))
     }
 
     /// Upload bytes without a local project mirror.
@@ -594,7 +544,10 @@ impl RemoteExecutorImpl {
 
     pub async fn upload_work_file_bytes_with_transport(&self, workspace: &Workspace, relative_path: &Path, data: &[u8], preference: TransferPreference) -> CoreResult<TransferMethod> {
         let temporary = LocalTemporary(temp_transfer_path("ul"));
-        std::fs::write(&temporary.0, data)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        { use std::io::Write; options.open(&temporary.0)?.write_all(data)?; }
         self.upload_local_file(workspace, relative_path, &temporary.0, preference).await
     }
 
@@ -638,8 +591,11 @@ impl RemoteExecutorImpl {
                 match transfer {
                     Ok(()) => transferred = Some(TransferMethod::SystemScp),
                     Err(error) if preference == TransferPreference::Scp => return Err(error),
-                    Err(error) => { warn!(error=%error, "scp failed; trying bounded base64 upload"); failures.push(error.to_string()); }
+                    Err(error) => { failures.push(error.to_string()); }
                 }
+            }
+            if transferred.is_none() && preference != TransferPreference::Base64 {
+                return Err(CoreError::Connection(format!("Binary upload failed; no automatic base64 fallback. {}", failures.join("; "))));
             }
             if transferred.is_none() {
                 // Avoid loading arbitrarily large project files into memory if
@@ -647,7 +603,12 @@ impl RemoteExecutorImpl {
                 if metadata.len() > 16 * 1024 * 1024 {
                     return Err(CoreError::Connection(format!("Binary transfer unavailable; base64 fallback is limited to 16 MiB. {}", failures.join("; "))));
                 }
-                let bytes = std::fs::read(&local)?;
+                use std::io::Read;
+                let mut bytes = Vec::new();
+                std::fs::File::open(&local)?.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 != metadata.len() || bytes.len() > 16 * 1024 * 1024 {
+                    return Err(CoreError::Validation("Upload source changed or exceeded the explicit base64 limit".into()));
+                }
                 upload_via_base64_exec(&self.with_timeout(remaining()?), workspace, &staging, &bytes).await
                     .map_err(|error| CoreError::Connection(format!("{}; {}", failures.join("; "), error)))?;
                 transferred = Some(TransferMethod::Base64Exec);
@@ -674,30 +635,7 @@ impl RemoteFileAccess for RemoteExecutorImpl {
         root: RemoteRootKind,
         relative_path: &Path,
     ) -> CoreResult<Vec<u8>> {
-        let remote_abs = self
-            .validate_mcp_read_target(workspace, root, relative_path)
-            .await?;
-        let limit = workspace.file_threshold_bytes;
-        let command = bounded_read_command(&remote_abs, limit)?;
-        let record = self
-            .execute_control(workspace, &command, None, &Default::default())
-            .await?;
-        match record.exit_code {
-            Some(0) if !record.output_truncated => decode_bounded_read(&record.stdout, limit),
-            Some(0) => Err(CoreError::InvalidState(
-                "Remote file output was truncated; no partial file was returned".into(),
-            )),
-            Some(23) => Err(CoreError::Validation(
-                "Remote read target must be a regular file".into(),
-            )),
-            Some(25) => Err(CoreError::Validation(format!(
-                "Remote file exceeds the read limit of {limit} bytes"
-            ))),
-            _ => Err(CoreError::Connection(format!(
-                "Bounded remote file read failed: {}",
-                record.stderr.trim()
-            ))),
-        }
+        Ok(self.read_remote_file_with_transport(workspace, root, relative_path, TransferPreference::Auto).await?.0)
     }
 
     async fn write_work_file(

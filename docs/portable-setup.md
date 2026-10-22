@@ -50,14 +50,14 @@ Host my-cluster
     HostName 192.0.2.20
     Port 2222
     User alice
-    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.6.0-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
+    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.6.1-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
 ```
 
 Mac 将程序位置替换为安装输出的绝对路径（没有 `.exe`）。代理地址/端口使用自己的设置；没有代理就省略 ProxyCommand。内置转发只支持无需用户名/密码的 SOCKS5；其它认证代理沿用合适的 ProxyCommand。代理只向 stdout 转发二进制，诊断走 stderr，握手默认 10 秒，可用 `--connect-timeout` 改。
 
 ## rsync 为可选能力
 
-`auto` 可在缺少/不兼容 rsync 时使用原生 scp/base64；显式 `--transport rsync` 失败即报错。两端需有 rsync，本机要求 >=3，以支持受保护的特殊文件名。Mac 自带旧版 2.6.9 不适用；可自行安装新版（例如 Homebrew），LRW 自动检查 `/opt/homebrew/bin/rsync`、`/usr/local/bin/rsync`。
+`auto` 优先 rsync，缺少、不兼容或失败时使用原生 SCP；两者都失败则报错，不自动改用 base64；显式 `--transport rsync` 失败即报错。两端需有 rsync，本机要求 >=3，以支持受保护的特殊文件名。Mac 自带旧版 2.6.9 不适用；可自行安装新版（例如 Homebrew），LRW 自动检查 `/opt/homebrew/bin/rsync`、`/usr/local/bin/rsync`。
 
 Windows rsync 使用匹配的原生发行版和配套 SSH。Cygwin SSH 的代理需要 sh/bash；LRW 优先配套 shell，其次 Git Bash，或显式 `LRWORKSPACE_RSYNC_SHELL`。基本 scp/MCP 功能没有 Bash/Git 依赖。Cygwin SSH 与 Windows agent 不保证互通，按其自身认证要求配置。不会自动安装依赖或修改系统 PATH/SHELL。
 

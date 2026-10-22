@@ -164,7 +164,7 @@ pub(super) async fn run(server: McpServer) -> CoreResult<()> {
             .unwrap_or("");
         let slots = if matches!(
             tool,
-            "workspace_run" | "workspace_submit" | "workspace_write_file"
+            "workspace_run" | "workspace_submit" | "workspace_write_file" | "workspace_read_file" | "workspace_download_file"
         ) {
             &work
         } else {
