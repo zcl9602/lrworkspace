@@ -53,7 +53,7 @@ echo "$SCHED"
 echo "---NODES---"
 case "$SCHED" in
     slurm)
-        sinfo -h -o '%n %c %m %G %t %P' 2>/dev/null | while read -r line; do
+        sinfo -N -h -o '%n %c %m %G %t %P' 2>/dev/null | while read -r line; do
             echo "$line"
         done
         ;;
@@ -150,7 +150,7 @@ impl ClusterDetectorImpl {
         }
     }
 
-    /// Parse a node line from sinfo -h -o '%n %c %m %G %t %P' or pbsnodes output:
+    /// Parse a node line from sinfo -N -h -o '%n %c %m %G %t %P' or pbsnodes output:
     ///   `hostname cpu_cores memory_mb gres state partition1,partition2,...`
     ///
     /// Minimum 3 fields (hostname, cores, mem). GPU, state, partition optional.

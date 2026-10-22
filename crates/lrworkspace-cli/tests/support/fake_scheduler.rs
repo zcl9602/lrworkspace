@@ -46,7 +46,10 @@ fn main() {
         }
         "sinfo"=> {
             if std::env::var_os("LRW_TEST_IDLE_COMPUTE").is_some() {
-                if args.iter().any(|arg|arg.contains("%n")) {println!("compute01 32 128000 (null) idle default");}
+                if args.iter().any(|arg|arg.contains("%n")) {
+                    if args.iter().any(|arg|arg=="-N"||arg=="--Node") {println!("compute01 32 128000 (null) idle default");}
+                    else {println!("compute[01-02] 32 128000 (null) idle default");}
+                }
                 else {println!("default* 1 1-00:00:00 1:00:00 compute01");}
             }
         }
