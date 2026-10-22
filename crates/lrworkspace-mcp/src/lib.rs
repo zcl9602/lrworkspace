@@ -591,14 +591,16 @@ impl McpServer {
             }
             "workspace_run" => self.run_command(&workspace, args, &agent).await,
             "workspace_cluster_info" => {
-                let cluster = match workspace_store::load_cluster_config(&self.config, workspace.id)
-                {
-                    Ok(cluster) => cluster,
-                    Err(_) => {
-                        let cluster = self.cluster_detector.discover_cluster(&workspace).await?;
-                        workspace_store::save_cluster_config(&self.config, &cluster, workspace.id)?;
-                        cluster
-                    }
+                let refresh=match args.get("refresh") {
+                    None=>false,Some(Value::Bool(value))=>*value,
+                    _=>return Err(CoreError::Validation("refresh must be a boolean".into())),
+                };
+                let previous=workspace_store::load_cluster_config(&self.config,workspace.id).ok();
+                let cluster=if !refresh && previous.is_some() { previous.unwrap() } else {
+                    let mut cluster=self.cluster_detector.discover_cluster(&workspace).await?;
+                    if let Some(previous)=previous {cluster.constraints=previous.constraints;}
+                    workspace_store::save_cluster_config(&self.config,&cluster,workspace.id)?;
+                    cluster
                 };
                 Ok(serde_json::to_value(cluster)?)
             }
@@ -809,8 +811,11 @@ impl McpServer {
                 if nodes.is_empty() {
                     return Err(CoreError::NotFound(format!("No nodes found for partition {}", partition)));
                 }
-                let cores_per_node = nodes[0].cpu_cores.max(1);
-                let mem_per_node_mb = nodes[0].memory_mb;
+                let cores_per_node = nodes.iter().map(|node| node.cpu_cores).min().unwrap_or(0);
+                let mem_per_node_mb = nodes.iter().map(|node| node.memory_mb).min().unwrap_or(0);
+                if cores_per_node == 0 || mem_per_node_mb == 0 {
+                    return Err(CoreError::InvalidState("Discovered CPU/memory metadata is incomplete; refresh topology before requesting recommendations".into()));
+                }
                 let (threads_per_task, mem_per_core_mb) = match workload {
                     "aligner" | "assembler" => (cores_per_node.min(32), (mem_per_node_mb / cores_per_node as u64).min(8000)),
                     "variant" => (cores_per_node.min(16), (mem_per_node_mb / cores_per_node as u64).min(4000)),
@@ -818,8 +823,9 @@ impl McpServer {
                     "mpi" => (cores_per_node, (mem_per_node_mb / cores_per_node as u64).min(4000)),
                     _ => (cores_per_node.min(8), (mem_per_node_mb / cores_per_node as u64).min(2000)),
                 };
-                let max_jobs = cluster.constraints.max_total_jobs.unwrap_or(50);
-                let max_cores = cluster.constraints.max_total_cores.unwrap_or(cores_per_node * 4);
+                let known_cores = nodes.iter().fold(0u32, |sum,node| sum.saturating_add(node.cpu_cores));
+                let max_cores = cluster.constraints.max_total_cores.unwrap_or(known_cores).min(known_cores);
+                let max_jobs = cluster.constraints.max_total_jobs.unwrap_or(max_cores / threads_per_task.max(1));
                 Ok(serde_json::json!({
                     "partition": partition,
                     "workload": workload,
@@ -829,8 +835,10 @@ impl McpServer {
                         "max_concurrent_jobs": max_jobs.min(max_cores / threads_per_task.max(1)),
                         "sbatch_flags": format!("--cpus-per-task={} --mem={}M", threads_per_task, (threads_per_task as u64) * mem_per_core_mb),
                     },
+                    "recommendation_basis": "Heuristic from discovered topology and optional user constraints; not a scheduler allocation or site-policy limit",
                     "partition_limits": {
-                        "nodes_available": nodes.len(),
+                        "nodes_available": nodes.iter().filter(|node| node.state == "idle").count(),
+                        "nodes_discovered": nodes.len(),
                         "cores_per_node": cores_per_node,
                         "memory_per_node_mb": mem_per_node_mb,
                     },
@@ -1457,7 +1465,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         tool("workspace_task_status", "Read one SSH task's live state, exit code and actual hostname without waiting for other commands. Unknown is not success. Handles survive MCP restart.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_task_logs", "Read independent bounded stdout/stderr tails and live task state. Output is read on the recorded compute node; empty output is not completion evidence.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_submit", "Build the supplied command-file array mode: filter blank/comments, shuffle, balance at most 1000 task scripts, bound concurrency by maxnum and maxcpu/(ntasks*cpu), continue after individual failures, and report aggregate failure. Provide exactly one of local_path or commands_text. Every run gets a fresh directory; prior files are retained. Default generates only; submit=true launches. PBS flavor is detected or explicitly pbs-pro/torque.", serde_json::json!({"workspace_id":{"type":"string"},"local_path":{"type":"string"},"commands_text":{"type":"string"},"batch":batch_schema(),"working_dir":{"type":"string"},"submit":{"type":"boolean","default":false},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &[]),
-        tool("workspace_cluster_info", "Discover scheduler and cluster topology.", workspace.clone(), &[]),
+        tool("workspace_cluster_info", "Read the cached scheduler/topology snapshot. refresh=true rediscovers topology, preserves user constraints, and replaces the cache. Missing resources stay unknown; cached data retains its original refreshed_at timestamp.", serde_json::json!({"workspace_id":{"type":"string"},"refresh":{"type":"boolean","default":false}}), &[]),
         tool("workspace_slurm_status", "Read scheduler job status (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
         tool("workspace_slurm_logs", "Read scheduler job logs (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
         tool("workspace_slurm_cancel", "Cancel a submitted scheduler job (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
@@ -1632,6 +1640,36 @@ mod tests {
         }
         let _=std::fs::remove_dir_all(root);
     }
+    #[tokio::test]
+    async fn resource_advice_rejects_unknown_metadata_and_uses_observed_capacity() {
+        let root=std::env::temp_dir().join(format!("lrw-resource-advice-{}",Uuid::new_v4()));
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};
+        let workspace:Workspace=serde_json::from_value(serde_json::json!({
+            "id":Uuid::new_v4(),"name":"fixture","display_name":"fixture",
+            "connection":{"host":"fixture.invalid","user":"fixture","port":22,"auth":"agent","jump_hosts":[]},
+            "remote_work_dir":"/work","remote_data_dirs":[],"node_execution_mode":"submit_only","authorized":true,
+            "created_at":chrono::Utc::now(),"last_accessed_at":chrono::Utc::now(),"file_threshold_bytes":1048576,"config":{}
+        })).unwrap();
+        workspace_store::save_workspace(&config,&workspace).unwrap();
+        let mut cluster=ClusterConfig{scheduler:ClusterScheduler::Slurm,nodes:vec![NodeInfo{hostname:"compute01".into(),cpu_cores:0,memory_mb:16000,gpu_count:0,gpu_model:None,state:"idle".into(),partitions:vec!["cpu".into()],arch:None}],partitions:vec![],constraints:Default::default(),refreshed_at:chrono::Utc::now()};
+        workspace_store::save_cluster_config(&config,&cluster,workspace.id).unwrap();
+        let server=McpServer::new(config.clone(),AgentKind::CliAgent).unwrap();
+        let args=serde_json::json!({"workspace_id":workspace.id,"partition":"cpu"});
+        assert!(matches!(server.call_tool("workspace_cluster_info",serde_json::json!({"workspace_id":workspace.id,"refresh":"true"}).as_object().unwrap()).await,Err(CoreError::Validation(_))));
+        assert!(matches!(server.call_tool("workspace_diagnose_suggest",args.as_object().unwrap()).await,Err(CoreError::InvalidState(_))));
+        cluster.nodes[0].cpu_cores=8;
+        workspace_store::save_cluster_config(&config,&cluster,workspace.id).unwrap();
+        let result=server.call_tool("workspace_diagnose_suggest",args.as_object().unwrap()).await.unwrap();
+        assert_eq!(result["recommended"]["max_concurrent_jobs"],1);
+        assert_eq!(result["partition_limits"]["cores_per_node"],8);
+        cluster.nodes[0].state="down".into();
+        workspace_store::save_cluster_config(&config,&cluster,workspace.id).unwrap();
+        let result=server.call_tool("workspace_diagnose_suggest",args.as_object().unwrap()).await.unwrap();
+        assert_eq!(result["partition_limits"]["nodes_available"],0);
+        assert_eq!(result["partition_limits"]["nodes_discovered"],1);
+        drop(server);std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn native_images_do_not_duplicate_base64_into_text_and_keep_redaction() {
         let bytes=b"\xff\xd8\xffsynthetic JPEG";

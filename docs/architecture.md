@@ -78,3 +78,9 @@ Windows 同一次调用的会话锁等待、写入确认和结果读取共享截
 ## 0.6.1 文件传输默认值
 
 read/download/write 默认 auto：rsync → SCP，失败明确报错。read/write 只有显式 transport=base64 才执行有界编码兼容路径。read 首先验证 regular file 和大小，再通过私有临时目录下载，校验长度后有界读取；MCP 图片只在 image content 中携带协议编码，文本 metadata 不含编码正文。完整 download 不加载整个文件，使用目标同目录的私有暂存目录，检查长度后 hard_link 原子创建新文件；目标已存在或并发创建会失败，绝不覆盖。每次下载共享 timeout_sec 预算，子进程在 spawn_blocking 执行，不阻塞 2 个异步 I/O 线程。只校验传输前后长度，不构成可变远端文件的内容快照或独立内容校验和保证。
+
+## 0.6.2 资源检测的未知值
+
+发现失败时不生成虚构节点或默认分区。缺少 CPU/内存时用 0 表示未取得数据，架构为 null；GPU 计数 0 兼容无设备和未报告。登录节点架构不代表各计算节点架构。PBS 内存保留单位后换算，Slurm 无单位值按其报告的 MiB 解析，不按数量级猜测。
+
+PBS 队列节点只采用节点明确报告的 queue 属性；缺少成员信息时保持空集合，不把全部节点填进去。`acl_hosts` 是可向队列提交任务的主机列表，见 [OpenPBS 官方属性说明](https://github.com/openpbs/openpbs/blob/master/doc/man1/pbs_queue_attributes.7B)。资源建议使用发现的容量和用户约束，明确标注启发式性质；缺少必需 CPU/内存信息时拒绝建议，避免把固定常量当成现场检测结果。旧缓存保留其原有时间戳，可用 `rw cluster refresh` 或 `workspace_cluster_info(refresh=true)` 更新，并保留用户资源约束。
