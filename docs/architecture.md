@@ -11,7 +11,7 @@
 | cli | rw/lrworkspace 命令行，用户级 MCP 安装 |
 | mcp | stdio 请求、工具 schema、表单、授权及诊断 journal |
 
-`resolve_execution_route` 同时供 CLI/MCP 使用，统一处理 cluster/direct/read-only。旧 `--force compute-node` 只映射为 cluster；cluster 默认提交，本次显式 `--compute-node HOST` 时通过登录节点 SSH 执行。不自动选择缓存空闲节点。单服务器模式 `single-server`（存储兼容 direct_compute）默认 direct，代码不根据命令字符串猜测计算地点。
+`resolve_execution_route` 同时供 CLI/MCP 使用，统一处理 cluster/direct/read-only。旧 `--force compute-node` 只映射为 cluster；cluster 默认根据新发现的调度器状态自动选择可达的空闲计算节点；可指定 `--compute-node HOST` 或 `--execution-path submit`。没有可用节点或提供 batch 资源时提交调度器。所有 workload 默认 cluster；单服务器模式 `single-server`（存储兼容 direct_compute）允许显式 direct，代码不根据命令字符串猜测计算地点。
 
 ## 文件和状态
 
@@ -39,17 +39,17 @@ agent 在自己的项目中编辑，提供本机文件路径给 LRW 上传。远
 
 本机传输子进程捕获 stdout/stderr，避免破坏 MCP 协议；有时间预算，超时终止本次进程树。Windows rsync 使用相对本地操作数、受保护远程参数、配套 Cygwin SSH；用户可指定原生 rsync 路径。配套 SSH 与 Win32 agent 的认证能力需单独核对。
 
-CLI/MCP 小文件读取使用有界 SSH，独立的库级完整下载 API 仍保留。传输临时文件不是项目镜像，不需要同步。
+CLI/MCP 小文件读取有大小上限，默认 rsync → SCP；完整下载直接写本机新文件。库级内存下载 API 受预览上限约束。传输临时文件不是项目镜像，不需要同步。
 
 ## 权限与完成证据
 
 文件 API 限定 work/data 根，写入只接受 work；命令按 SSH 用户真实权限执行，没有 OS 级只读沙箱。目录校验也不构成对并发 symlink 替换的完整隔离。不得将数据根只读约定理解为 Unix 权限已改变。
 
-submit_only 的 workload 默认经调度器；仅本次明确授权的 compute_node 可走 SSH 第二跳。控制查询和文件访问仍在登录 endpoint；提交路径缺失调度器时失败，SSH 路径不依赖调度器。两条路径均不回落登录节点，未确认模式不执行 workload。
+submit_only 的 workload 默认自动选择空闲计算节点走 SSH 第二跳，不可用时经调度器；显式 compute_node 可固定节点。控制查询和文件访问仍在登录 endpoint；提交路径缺失调度器时失败，SSH 路径不依赖调度器。两条路径均不回落登录节点，未确认模式不执行 workload。
 
 作业未知或队列无记录不等于完成。日志缺失/不可读在现有日志接口中仍可能表现为空内容，需结合明确终态及实际输出核对。诊断分类只是排查线索。
 
-默认操作预算 120 秒，CLI/MCP 参数可覆盖。调度器作业时限独立；轮询预算也不包含所有在途 SSH 与收尾耗时。MCP 仍串行处理请求；表单期间交错消息暂存后按序处理，不会自动确认。
+默认操作预算 120 秒，CLI/MCP 参数可覆盖。调度器作业时限独立；轮询预算也不包含所有在途 SSH 与收尾耗时。MCP 并发处理独立请求并按请求 ID 关联响应；表单等待不阻塞其他调用，也不会自动确认。Windows 端点使用有界 SSH 会话池，默认后台命令使用独立远端进程与持久句柄；监控日志读取有界尾部。
 
 运行时不自动安装 OpenSSH、提升系统权限或创建本地项目绑定。Windows 使用原生 exe；Unix 系统 SSH 使用 ControlMaster，部分备用读取依赖 ssh2。
 
@@ -74,3 +74,13 @@ Windows 同一次调用的会话锁等待、写入确认和结果读取共享截
 生产数组提交只打乱索引，通过资源预检后逐个生成归档成员，将 TAR 写入独占临时文件并从磁盘上传；不复制整份命令列表、不为预检生成完整脚本、不同时保留全部脚本和整份 TAR。commands.tsv 目前按一个成员生成，其大小仍受计划预算限制。兼容库 API 的 BatchPlan::build/archive 仍可在内存中生成，生产 CLI/MCP 不使用该路径。临时归档在成功或失败后清理，远端新 run 和既有结果仍保留。
 
 0.3.3 的 PBS 单命令组对两个方言都按普通作业提交；多组仍用各自数组参数。原生 PBS 提交将日志位置通过 qsub -o/-e 真实参数传递，避免旧 Torque 的指令引号被当作文件名。数组状态优先读取具体子任务，避免始终为 R 的模板掩盖终态；旧版 PBS 集群 的站点数组启动器问题单独记录在实机验收文档中。
+
+## 0.6.1 文件传输默认值
+
+read/download/write 默认 auto：rsync → SCP，失败明确报错。read/write 只有显式 transport=base64 才执行有界编码兼容路径。read 首先验证 regular file 和大小，再通过私有临时目录下载，校验长度后有界读取；MCP 图片只在 image content 中携带协议编码，文本 metadata 不含编码正文。完整 download 不加载整个文件，使用目标同目录的私有暂存目录，检查长度后 hard_link 原子创建新文件；目标已存在或并发创建会失败，绝不覆盖。每次下载共享 timeout_sec 预算，子进程在 spawn_blocking 执行，不阻塞 2 个异步 I/O 线程。只校验传输前后长度，不构成可变远端文件的内容快照或独立内容校验和保证。
+
+## 0.6.2 资源检测的未知值
+
+发现失败时不生成虚构节点或默认分区。缺少 CPU/内存时用 0 表示未取得数据，架构为 null；GPU 计数 0 兼容无设备和未报告。登录节点架构不代表各计算节点架构。PBS 内存保留单位后换算，Slurm 无单位值按其报告的 MiB 解析，不按数量级猜测。
+
+PBS 队列节点只采用节点明确报告的 queue 属性；缺少成员信息时保持空集合，不把全部节点填进去。`acl_hosts` 是可向队列提交任务的主机列表，见 [OpenPBS 官方属性说明](https://github.com/openpbs/openpbs/blob/master/doc/man1/pbs_queue_attributes.7B)。资源建议使用发现的容量和用户约束，明确标注启发式性质；缺少必需 CPU/内存信息时拒绝建议，避免把固定常量当成现场检测结果。旧缓存保留其原有时间戳，可用 `rw cluster refresh` 或 `workspace_cluster_info(refresh=true)` 更新，并保留用户资源约束。

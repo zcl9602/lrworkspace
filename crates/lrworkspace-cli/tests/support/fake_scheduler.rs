@@ -4,6 +4,26 @@ fn main() {
     let program=std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().to_ascii_lowercase();
     let args:Vec<_>=std::env::args().skip(1).collect();
     match program.as_str() {
+        "setsid"=>{
+            #[cfg(unix)] {
+                use std::os::unix::process::CommandExt;
+                unsafe extern "C" {fn setsid()->i32;}
+                if unsafe {setsid()}<0 {std::process::exit(1);}
+                let error=std::process::Command::new(&args[0]).args(&args[1..]).exec();
+                eprintln!("fixture exec failed: {error}");std::process::exit(1);
+            }
+            #[cfg(windows)] {
+                use std::os::windows::process::CommandExt;
+                // Native CreateProcess searches System32 before PATH; select GNU timeout, not TIMEOUT.EXE.
+                let program=std::env::split_paths(&std::env::var_os("PATH").unwrap()).find_map(|directory|{
+                    let path=directory.join(format!("{}.exe",args[0].trim_end_matches(".exe")));
+                    path.is_file().then_some(path)
+                }).unwrap_or_else(||std::path::PathBuf::from(&args[0]));
+                let status=std::process::Command::new(program).args(&args[1..])
+                    .creation_flags(0x08000200).status().unwrap();
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
         "hostname"=>{
             let compute=std::env::var_os("LRW_TEST_ON_COMPUTE").is_some() && std::env::var_os("LRW_TEST_SAME_HOST").is_none();
             println!("{}",if compute {"compute-fixture"} else {"login-fixture"});
@@ -24,6 +44,15 @@ fn main() {
             #[cfg(windows)] {use std::os::windows::process::CommandExt;command.creation_flags(0x08000000);}
             let status=command.status().unwrap();std::process::exit(status.code().unwrap_or(1));
         }
+        "sinfo"=> {
+            if std::env::var_os("LRW_TEST_IDLE_COMPUTE").is_some() {
+                if args.iter().any(|arg|arg.contains("%n")) {
+                    if args.iter().any(|arg|arg=="-N"||arg=="--Node") {println!("compute01 32 128000 (null) idle default");}
+                    else {println!("compute[01-02] 32 128000 (null) idle default");}
+                }
+                else {println!("default* 1 1-00:00:00 1:00:00 compute01");}
+            }
+        }
         "sbatch"|"qsub"=>{
             if args.iter().any(|arg|arg=="--version") {println!("pbs_version = 23.06.06");return;}
             let log=std::env::var_os("LRW_TEST_SUBMIT_LOG").expect("test log");
@@ -32,7 +61,21 @@ fn main() {
             writeln!(file,"{} {}",program,args.join(" ")).unwrap();
             if program=="sbatch"{println!("Submitted batch job 4242");}else{println!("4243[].server");}
         }
-        "rsync"|"scp"=>{eprintln!("test binary transport disabled; use base64 through fake SSH");std::process::exit(1);}
+        "rsync"|"scp"=>{
+            if args.iter().any(|arg|arg=="--version") { println!("rsync version 3.4.1 protocol version 32"); return; }
+            use std::io::Write;
+            let mut log=std::fs::OpenOptions::new().create(true).append(true).open(std::env::var_os("LRW_TEST_TRANSFER_LOG").unwrap()).unwrap();
+            writeln!(log,"{program}").unwrap();
+            if std::env::var_os(format!("LRW_TEST_FAIL_{}",program.to_uppercase())).is_some() { eprintln!("fixture transport unavailable"); std::process::exit(1); }
+            let path=|arg:&str| {
+                let value=if arg.contains('@') {arg.split_once(':').unwrap().1} else {arg};
+                #[cfg(windows)] let value=if value.starts_with('/') && value.as_bytes().get(2)==Some(&b'/') {format!("{}:{}", &value[1..2], &value[2..])} else {value.to_string()};
+                std::path::PathBuf::from(value)
+            };
+            let source=path(&args[args.len()-2]); let target=path(args.last().unwrap());
+            std::fs::copy(source,&target).unwrap();
+            if std::env::var_os("LRW_TEST_TRANSFER_TRUNCATED").is_some() { std::fs::write(target,b"bad").unwrap(); }
+        }
         _=>std::process::exit(2),
     }
 }

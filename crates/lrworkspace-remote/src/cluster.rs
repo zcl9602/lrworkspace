@@ -13,7 +13,6 @@
 //! and parsed locally, avoiding fragile per-command SSH round-trips.
 
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
@@ -53,30 +52,31 @@ echo "$SCHED"
 echo "---NODES---"
 case "$SCHED" in
     slurm)
-        sinfo -h -o '%n %c %m %G %t %P' 2>/dev/null | while read -r line; do
+        sinfo -N -h -o '%n %c %m %G %t %P' 2>/dev/null | while read -r line; do
             echo "$line"
         done
         ;;
     pbs)
         pbsnodes -a 2>/dev/null | awk '
-            /^[a-zA-Z]/ { if (name != "") { printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, state, queue } name=$1; cores="1"; mem="0"; gpus="0"; state="?"; queue="default" }
+            /^[a-zA-Z]/ { if (name != "") { printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, (busy ? "alloc" : state), queue } name=$1; busy=0; explicit_state=0; cores="0"; mem="0"; gpus="0"; state="?"; queue="" }
             /^[[:space:]]*np[[:space:]]*=/ { n=$3; gsub(/[^0-9]/,"",n); cores=n }
-            /^[[:space:]]*state[[:space:]]*=/ && $0 !~ /status/ { s=$3; gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); state=s }
-            /^[[:space:]]*ntype/ { if ($3 == "cluster") state="free" }
+            /^[[:space:]]*state[[:space:]]*=/ && $0 !~ /status/ { s=$3; gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); state=s; explicit_state=1 }
+            /^[[:space:]]*jobs[[:space:]]*=/ && NF>=3 { busy=1 }
+            /^[[:space:]]*queue[[:space:]]*=/ { queue=$3 }
             /status[[:space:]]*=/ {
                 # Parse comma-separated key=value pairs
                 rest=$0; gsub(/^[[:space:]]*status[[:space:]]*=[[:space:]]*/,"",rest);
                 n=split(rest, kvs, ",");
                 for (i=1; i<=n; i++) {
                     kv=kvs[i]; gsub(/^[[:space:]]+|[[:space:]]+$/,"",kv);
-                    if (kv ~ /^physmem=/) { v=kv; gsub(/[^0-9]/,"",v); mem=v }
-                    if (kv ~ /^state=/) { v=kv; sub(/^state=/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); state=v }
+                    if (kv ~ /^physmem=/) { v=kv; sub(/^physmem=/,"",v); mem=v }
+                    if (!explicit_state && kv ~ /^state=/) { v=kv; sub(/^state=/,"",v); gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); state=v }
                     if (kv ~ /^ncpus=/) { v=kv; gsub(/[^0-9]/,"",v); cores=v }
                     if (kv ~ /^gres=/ && kv !~ /gres=\s*,/) { v=kv; gsub(/[^a-zA-Z0-9:]/,"",v); sub(/^gres=/,"",v); gpus=v }
                 }
             }
-            /^[[:space:]]*physmem[[:space:]]*=/ && $0 !~ /status/ { m=$3; gsub(/[^0-9]/,"",m); mem=m }
-            END { if (name != "") printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, state, queue }
+            /^[[:space:]]*physmem[[:space:]]*=/ && $0 !~ /status/ { mem=$3 }
+            END { if (name != "") printf "%s %s %s %s %s %s\n", name, cores, mem, gpus, (busy ? "alloc" : state), queue }
         ' 2>/dev/null
         ;;
     sge)
@@ -86,11 +86,15 @@ case "$SCHED" in
         bhosts 2>/dev/null | awk 'NR>1 && $1!="" { printf "%s %s ? ? %s %s ?\n", $1, $4, $2, $1 }'
         ;;
     *)
-        echo "${HOSTNAME:-localhost} $(nproc 2>/dev/null || echo 1) $(free -m 2>/dev/null | awk '/Mem/{print $2}' || echo 0) 0 - idle default"
+        host=$(hostname -s 2>/dev/null || printf '%s' "${HOSTNAME:-}")
+        cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || printf '0')
+        mem=$(free -m 2>/dev/null | awk '/Mem/{print $2}')
+        if [ -n "$host" ]; then printf '%s %s %s ? unknown\n' "$host" "${cores:-0}" "${mem:-0}"; fi
         ;;
 esac
-# Add architecture hint
-echo "ARCH:$(uname -m 2>/dev/null || echo x86_64)"
+# Architecture describes only this endpoint, never every compute node.
+arch=$(uname -m 2>/dev/null)
+if [ -n "$arch" ]; then printf 'ARCH:%s\n' "$arch"; fi
 
 echo "---PARTITIONS---"
 case "$SCHED" in
@@ -106,25 +110,10 @@ case "$SCHED" in
         qstat -Q 2>/dev/null | awk 'NR>2 && NF>0 && $1 !~ /^-/ { print $1, "?", "?", "?", "?", "false", "-" }'
         ;;
     *)
-        echo "default 1 infinite 1:00:00 100 true localhost"
+        # No scheduler-reported queues: leave the collection empty.
+        :
         ;;
 esac
-# Additional queue node lists for PBS
-if [ "$SCHED" = "pbs" ]; then
-    echo "---QUEUE_NODES---"
-    # Use grep+sed per queue: extract acl_hosts lines precisely,
-    # then clean whitespace. Much simpler than the shell loop.
-    qstat -Q 2>/dev/null | awk 'NR>2 && NF>0 && $1 !~ /^-/ { print $1 }' | while read -r qname; do
-        # Extract the acl_hosts block for this queue from qstat -Qf
-        BLOCK=$(qstat -Qf "$qname" 2>/dev/null || true)
-        HOSTS=$(echo "$BLOCK" | grep '^[[:space:]]*acl_hosts[[:space:]]=' | head -1 | sed 's/.*= *//' | tr -d '[:space:]')
-        if [ -n "$HOSTS" ]; then
-            echo "$qname $HOSTS"
-        else
-            echo "$qname ALL_NODES"
-        fi
-    done
-fi
 echo "---END---"
 "#;
 
@@ -150,7 +139,7 @@ impl ClusterDetectorImpl {
         }
     }
 
-    /// Parse a node line from sinfo -h -o '%n %c %m %G %t %P' or pbsnodes output:
+    /// Parse a node line from sinfo -N -h -o '%n %c %m %G %t %P' or pbsnodes output:
     ///   `hostname cpu_cores memory_mb gres state partition1,partition2,...`
     ///
     /// Minimum 3 fields (hostname, cores, mem). GPU, state, partition optional.
@@ -160,16 +149,8 @@ impl ClusterDetectorImpl {
             return None;
         }
         let hostname = parts[0].clone();
-        let cpu_cores: u32 = parts[1].parse().unwrap_or(1);
-        let memory_mb: u64 = parts[2].parse().unwrap_or(0);
-        // Raw value could be bytes, KB or MB — normalize to MB
-        let memory_mb = if memory_mb > 1_000_000_000 {
-            memory_mb / 1_048_576 // bytes → MB
-        } else if memory_mb > 10_000_000 {
-            memory_mb / 1024 // KB → MB (e.g. 263793212KB → 257610MB)
-        } else {
-            memory_mb // already MB
-        };
+        let cpu_cores: u32 = parts[1].parse().unwrap_or(0);
+        let memory_mb = Self::parse_memory_mb(&parts[2]);
 
         // GPU field (parts[3]) if present
         let (gpu_count, gpu_model) = if parts.len() > 3 {
@@ -209,6 +190,23 @@ impl ClusterDetectorImpl {
             partitions,
             arch: None,
         })
+    }
+
+    /// Slurm supplies MiB without a suffix; PBS supplies explicit units.
+    /// Never infer a unit from the magnitude of the reported number.
+    fn parse_memory_mb(raw: &str) -> u64 {
+        let split=raw.find(|c:char| !c.is_ascii_digit() && c!='.').unwrap_or(raw.len());
+        let Ok(value)=raw[..split].parse::<f64>() else { return 0; };
+        let scale=match raw[split..].to_ascii_lowercase().as_str() {
+            ""|"m"|"mb"|"mib" => 1.0,
+            "b" => 1.0/1048576.0,
+            "k"|"kb"|"kib" => 1.0/1024.0,
+            "g"|"gb"|"gib" => 1024.0,
+            "t"|"tb"|"tib" => 1048576.0,
+            _ => return 0,
+        };
+        let mib=value*scale;
+        if mib.is_finite() && mib>=0.0 && mib<u64::MAX as f64 { mib as u64 } else { 0 }
     }
 
     /// Slurm marks the default partition with a trailing `*` in `sinfo`
@@ -297,11 +295,10 @@ impl ClusterDetectorImpl {
     }
 
     /// Parse the full output from `CLUSTER_DETECT_SCRIPT`.
-    fn parse_cluster_output(workspace: &Workspace, output: &str) -> ClusterConfig {
+    fn parse_cluster_output(_workspace: &Workspace, output: &str) -> ClusterConfig {
         let mut scheduler = ClusterScheduler::None;
         let mut nodes: Vec<NodeInfo> = Vec::new();
         let mut partitions: Vec<PartitionInfo> = Vec::new();
-        let mut queue_nodes: HashMap<String, Vec<String>> = HashMap::new(); // queue name → node list
         let mut section = "";
         let mut arch_hint: Option<String> = None;
 
@@ -311,10 +308,9 @@ impl ClusterDetectorImpl {
                 "---SCHEDULER---" => section = "scheduler",
                 "---NODES---" => section = "nodes",
                 "---PARTITIONS---" => section = "partitions",
-                "---QUEUE_NODES---" => section = "queue_nodes",
                 "---END---" => section = "",
                 _ if line.starts_with("ARCH:") => {
-                    arch_hint = Some(line[5..].to_string());
+                    arch_hint = (!line[5..].is_empty()).then(|| line[5..].to_string());
                 }
                 _ => {
                     if line.is_empty() {
@@ -339,66 +335,26 @@ impl ClusterDetectorImpl {
                                 partitions.push(part);
                             }
                         }
-                        "queue_nodes" => {
-                            let parts: Vec<&str> = line.splitn(2, ' ').collect();
-                            if parts.len() == 2 {
-                                let raw_nodes = parts[1].trim();
-                                let nodes_in_queue: Vec<String> = if raw_nodes == "ALL_NODES" {
-                                    // No acl_hosts → all nodes can submit to this queue
-                                    nodes.iter().map(|n| n.hostname.clone()).collect()
-                                } else {
-                                    // Strip all whitespace (newlines, tabs, spaces) then split
-                                    let cleaned: String =
-                                        raw_nodes.chars().filter(|c| !c.is_whitespace()).collect();
-                                    if cleaned.is_empty() {
-                                        vec!["(unknown)".into()]
-                                    } else {
-                                        cleaned
-                                            .split(',')
-                                            .map(|s| s.trim().to_string())
-                                            .filter(|s| !s.is_empty())
-                                            .collect()
-                                    }
-                                };
-                                queue_nodes.insert(parts[0].to_string(), nodes_in_queue);
-                            }
-                        }
                         _ => {}
                     }
                 }
             }
         }
 
-        // Enrich partitions with node lists from queue_nodes
-        for part in &mut partitions {
-            if let Some(nodes_list) = queue_nodes.get(&part.name) {
-                part.nodes = nodes_list.clone();
-                part.total_nodes = nodes_list.len() as u32;
+        // PBS acl_hosts restricts submission hosts; it does not list compute nodes.
+        // Only attach queue membership explicitly reported by pbsnodes.
+        if scheduler == ClusterScheduler::Pbs {
+            for part in &mut partitions {
+                part.nodes = nodes.iter().filter(|node| node.partitions.contains(&part.name)).map(|node| node.hostname.clone()).collect();
+                part.total_nodes = part.nodes.len() as u32;
             }
         }
 
-        // Apply arch hint to nodes
-        if let Some(ref arch) = arch_hint {
-            for node in &mut nodes {
-                if node.arch.is_none() {
-                    node.arch = Some(arch.clone());
-                }
-            }
+        // uname ran on the SSH endpoint. It cannot establish compute-node architecture.
+        if scheduler == ClusterScheduler::None {
+            for node in &mut nodes { node.arch = arch_hint.clone(); }
         }
-
-        // If no nodes discovered, create a single local node entry
-        if nodes.is_empty() {
-            nodes.push(NodeInfo {
-                hostname: workspace.connection.host.clone(),
-                cpu_cores: 1,
-                memory_mb: 1024,
-                gpu_count: 0,
-                gpu_model: None,
-                state: "unknown".into(),
-                partitions: partitions.iter().map(|p| p.name.clone()).collect(),
-                arch: arch_hint,
-            });
-        }
+        // Empty discovery stays empty; never invent a 1-core/1-GiB node.
 
         ClusterConfig {
             scheduler,
@@ -476,6 +432,64 @@ impl ClusterDetector for ClusterDetectorImpl {
 mod tests {
     use super::*;
 
+    fn workspace() -> Workspace {
+        serde_json::from_value(serde_json::json!({
+            "id":uuid::Uuid::new_v4(),"name":"fixture","display_name":"fixture",
+            "connection":{"host":"fixture.invalid","user":"fixture","port":22,"auth":"agent","jump_hosts":[]},
+            "remote_work_dir":"/work","remote_data_dirs":[],"node_execution_mode":"submit_only",
+            "authorized":true,"created_at":chrono::Utc::now(),"last_accessed_at":chrono::Utc::now(),"file_threshold_bytes":1048576,"config":{}
+        })).unwrap()
+    }
+
+    #[test]
+    fn empty_discovery_never_invents_resources_and_endpoint_arch_stays_local() {
+        let workspace=workspace();
+        for scheduler in ["none","slurm","pbs"] {
+            let output=format!("---SCHEDULER---\n{scheduler}\n---NODES---\nARCH:aarch64\n---PARTITIONS---\n---END---\n");
+            let config=ClusterDetectorImpl::parse_cluster_output(&workspace,&output);
+            assert!(config.nodes.is_empty()); assert!(config.partitions.is_empty());
+        }
+        let config=ClusterDetectorImpl::parse_cluster_output(&workspace,"---SCHEDULER---\nslurm\n---NODES---\ncompute01 ? ? ? idle default\nARCH:aarch64\n---END---\n");
+        assert_eq!(config.nodes[0].cpu_cores,0); assert_eq!(config.nodes[0].memory_mb,0); assert_eq!(config.nodes[0].arch,None);
+        let config=ClusterDetectorImpl::parse_cluster_output(&workspace,"---SCHEDULER---\nnone\n---NODES---\nstandalone 8 16000 ? unknown\nARCH:aarch64\n---PARTITIONS---\n---END---\n");
+        assert_eq!(config.nodes[0].arch.as_deref(),Some("aarch64")); assert!(config.partitions.is_empty());
+    }
+
+    #[test]
+    fn reported_memory_units_are_preserved_without_magnitude_guesses() {
+        for (raw,expected) in [("8388608kb",8192),("8gb",8192),("8.5GiB",8704),("8589934592b",8192),("16000",16000),("20000000",20000000),("?",0),("8unknown",0)] {
+            assert_eq!(ClusterDetectorImpl::parse_memory_mb(raw),expected,"{raw}");
+        }
+    }
+
+    #[test]
+    fn pbs_queue_membership_is_reported_not_guessed_from_submission_acls() {
+        let config=ClusterDetectorImpl::parse_cluster_output(&workspace(),"---SCHEDULER---\npbs\n---NODES---\ncompute01 8 16000 0 free workq\ncompute02 8 16000 0 free\n---PARTITIONS---\nworkq ? ? ? ? false -\nunknownq ? ? ? ? false -\n---END---\n");
+        assert_eq!(config.partitions[0].nodes,vec!["compute01"]);
+        assert_eq!(config.partitions[0].total_nodes,1);
+        assert!(config.partitions[1].nodes.is_empty());
+        assert!(config.nodes[1].partitions.is_empty());
+    }
+
+    #[test]
+    fn failed_standalone_probes_report_unknown_without_a_fake_partition() {
+        #[cfg(windows)] let bash=r"C:\Program Files\Git\bin\bash.exe";
+        #[cfg(unix)] let bash="/bin/bash";
+        let stubs=r#"
+command() { return 1; }
+hostname() { printf 'standalone-test\n'; }
+getconf() { return 1; }
+nproc() { return 1; }
+free() { return 1; }
+uname() { return 1; }
+"#;
+        let output=std::process::Command::new(bash).args(["-c",&format!("{stubs}\n{CLUSTER_DETECT_SCRIPT}")]).output().unwrap();
+        assert!(output.status.success());
+        let config=ClusterDetectorImpl::parse_cluster_output(&workspace(),&String::from_utf8(output.stdout).unwrap());
+        assert_eq!(config.nodes.len(),1); assert_eq!(config.nodes[0].cpu_cores,0); assert_eq!(config.nodes[0].memory_mb,0);
+        assert_eq!(config.nodes[0].state,"unknown"); assert_eq!(config.nodes[0].arch,None); assert!(config.partitions.is_empty());
+    }
+
     #[test]
     fn gridview_pbs_is_not_misdetected_as_grid_engine() {
         #[cfg(windows)] let bash=r"C:\Program Files\Git\bin\bash.exe";
@@ -493,6 +507,22 @@ qconf() { :; }
             assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
             assert!(String::from_utf8_lossy(&output.stdout).contains(&format!("---SCHEDULER---\n{expected}\n")),"{}",String::from_utf8_lossy(&output.stdout));
         }
+    }
+
+    #[test]
+    fn pbs_node_type_never_overrides_offline_or_allocated_state() {
+        #[cfg(windows)] let bash=r"C:\Program Files\Git\bin\bash.exe";
+        #[cfg(unix)] let bash="/bin/bash";
+        let stubs=r#"
+command() { case "$1:$2" in -v:qsub) return 0;; *) return 1;; esac; }
+qstat() { :; }
+pbsnodes() { printf '%s\n' 'node-offline' '    state = offline' '    ntype = cluster' '    status = state=free' 'node-busy' '    state = free' '    ntype = cluster' '    jobs = 0/123.server' '    status = state=free,ncpus=32' 'node-idle' '    state = free' '    ntype = cluster'; }
+"#;
+        let output=std::process::Command::new(bash).args(["-c",&format!("{stubs}\n{CLUSTER_DETECT_SCRIPT}")]).output().unwrap();
+        assert!(output.status.success());let text=String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("node-offline 0 0 0 offline"),"{text}");
+        assert!(text.contains("node-busy 32 0 0 alloc"),"{text}");
+        assert!(text.contains("node-idle 0 0 0 free"),"{text}");
     }
 
     #[test]

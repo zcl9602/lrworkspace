@@ -90,7 +90,7 @@ fn main() {
     run_server();
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn run_server() {
     tracing_subscriber::fmt()
         .with_writer(lrworkspace_core::privacy::RedactingStderr::default)
@@ -111,7 +111,7 @@ async fn run_server() {
     // Agent identity is set during MCP initialize from clientInfo
     let agent = AgentKind::CliAgent; // default, overridden by initialize
 
-    let mut server = match McpServer::new(config, agent) {
+    let server = match McpServer::new(config, agent) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to initialize MCP server: {}", e);

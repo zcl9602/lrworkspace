@@ -1,7 +1,46 @@
 //! Explicit, per-request SSH execution through the configured login node.
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use lrworkspace_core::{CoreError, CoreResult, safety::{normalize_remote_absolute, shell_quote}, types::*};
 use crate::{ExecutionRoute, RemoteExecutorImpl};
+use lrworkspace_core::{config::LrWorkspaceConfig, traits::ClusterDetector, workspace_store};
+
+/// Probe fresh scheduler-advertised idle nodes before sending any workload.
+/// A failed probe is safe to retry; an attempted workload is never replayed.
+pub async fn choose_compute_node(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
+    workspace: &Workspace) -> CoreResult<Option<String>> {
+    let probe = executor.with_timeout(executor.timeout().min(Duration::from_secs(10)));
+    let mut cluster = crate::ClusterDetectorImpl::new(Arc::new(probe)).discover_cluster(workspace).await?;
+    if let Ok(previous) = workspace_store::load_cluster_config(config, workspace.id) {
+        cluster.constraints = previous.constraints;
+    }
+    workspace_store::save_cluster_config(config, &cluster, workspace.id)?;
+    let mut nodes = eligible_compute_nodes(workspace, &cluster);
+    // Spread simultaneous requests over the eligible nodes instead of always choosing the first.
+    if !nodes.is_empty() {
+        let offset = (uuid::Uuid::new_v4().as_u128() % nodes.len() as u128) as usize;
+        nodes.rotate_left(offset);
+    }
+    let probe = executor.with_timeout(executor.timeout().min(Duration::from_secs(5)));
+    for node in nodes.into_iter().take(4) {
+        if probe.execute_compute_ssh(workspace, &node, ":", None).await.is_ok_and(|r|r.exit_code==Some(0)) {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+fn eligible_compute_nodes(workspace: &Workspace, cluster: &ClusterConfig) -> Vec<String> {
+    if !matches!(cluster.scheduler, ClusterScheduler::Slurm|ClusterScheduler::Pbs) { return Vec::new(); }
+    let mut nodes = cluster.nodes.iter().filter(|node| {
+        node.state == "idle" && node.cpu_cores > 0
+        && !node.hostname.eq_ignore_ascii_case(&workspace.connection.host)
+        && validate_compute_node(ExecutionRoute::Cluster,Some(&node.hostname),false).is_ok()
+        && (cluster.constraints.allowed_partitions.is_empty()
+            || node.partitions.iter().any(|p|cluster.constraints.allowed_partitions.contains(p))
+            || cluster.partitions.iter().any(|p|cluster.constraints.allowed_partitions.contains(&p.name) && p.nodes.contains(&node.hostname)))
+    }).map(|node|node.hostname.clone()).collect::<Vec<_>>();
+    nodes.sort(); nodes.dedup(); nodes
+}
 
 /// Supplying a named node is the caller's explicit authorization for this call.
 /// Never interpret flags, usernames, shell syntax or arbitrary SSH arguments.

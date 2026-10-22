@@ -109,7 +109,7 @@ pub struct RemoteExecutorImpl {
     max_output_bytes: usize,
     timeout: Duration,
     #[cfg(windows)]
-    windows_sessions: Arc<Mutex<HashMap<String, Arc<Mutex<WindowsSshSession>>>>>,
+    windows_sessions: Arc<Mutex<HashMap<String, Vec<Arc<Mutex<WindowsSshSession>>>>>>,
 }
 
 impl RemoteExecutorImpl {
@@ -150,41 +150,44 @@ impl RemoteExecutorImpl {
             let limit=self.max_output_bytes;
             tokio::task::spawn_blocking(move || {
                 let key = windows_session_key(&config);
-                // Only the host map is briefly locked to fetch or create the
-                // per-host session; commands on different hosts run in
-                // parallel instead of serializing on one global lock.
-                let session = {
-                    let mut sessions = lock_before(&sessions,deadline)?;
-                    if let Some(existing) = sessions.get(&key) {
-                        existing.clone()
-                    } else {
-                        let spawned =
-                            Arc::new(Mutex::new(WindowsSshSession::spawn(&config, timeout)?));
-                        sessions.insert(key.clone(), spawned.clone());
-                        spawned
-                    }
-                };
-                let result = {
-                    let mut guard=lock_before(&session,deadline)?;
-                    let result=guard.execute(&command,login_shell,deadline,limit);
-                    if result.is_err(){guard.healthy=false;let _=guard.child.kill();}
-                    result
-                };
-                if result.is_err() {
-                    // A transport-level failure leaves the frame protocol in
-                    // an unknown state; drop only this host's session so the
-                    // next call reconnects. Command failures (nonzero exit
-                    // codes) return Ok and keep the session alive.
-                    let mut sessions = sessions
-                        .lock()
-                        .map_err(|_| CoreError::InvalidState("SSH session lock poisoned".into()))?;
-                    if let Some(current) = sessions.get(&key) {
-                        if Arc::ptr_eq(current, &session) {
-                            sessions.remove(&key);
+                loop {
+                    let candidate = {
+                        let mut sessions = lock_before(&sessions, deadline)?;
+                        let pool = sessions.entry(key.clone()).or_default();
+                        pool.retain(|session| session.try_lock().map(|guard|guard.healthy).unwrap_or(true));
+                        if let Some(idle) = pool.iter().find(|session|session.try_lock().is_ok()) {
+                            Some(idle.clone())
+                        } else if pool.len() < 32 {
+                            // Spawn only reserves local pipes; authentication occurs outside the map lock.
+                            let session = Arc::new(Mutex::new(WindowsSshSession::spawn(&config,
+                                deadline.saturating_duration_since(std::time::Instant::now()))?));
+                            pool.push(session.clone());
+                            Some(session)
+                        } else { None }
+                    };
+                    if let Some(session) = candidate {
+                        if let Ok(mut guard) = session.try_lock() {
+                            let result = guard.execute(&command, login_shell, deadline, limit);
+                            if result.is_err() { guard.healthy=false; let _=guard.child.kill(); }
+                            drop(guard);
+                            // Keep at most two idle sessions, retaining every busy session.
+                            if let Ok(mut sessions)=sessions.try_lock() {
+                              if let Some(pool)=sessions.get_mut(&key) {
+                                let mut idle=0;
+                                pool.retain(|item|match item.try_lock() {
+                                    Ok(guard)=> { idle+=1; guard.healthy && idle<=2 },
+                                    Err(_)=>true,
+                                });
+                              }
+                            }
+                            return result;
                         }
                     }
+                    if std::time::Instant::now()>=deadline {
+                        return Err(CoreError::Timeout("SSH session pool deadline exceeded".into()));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
                 }
-                result
             })
             .await
             .map_err(|error| CoreError::Connection(format!("SSH session join error: {error}")))?
@@ -216,7 +219,7 @@ impl RemoteExecutorImpl {
                 if key.contains(&marker){
                     // Never wait on an in-flight command's session mutex. It
                     // owns an Arc until completion; dropping it then closes SSH.
-                    if let Ok(mut idle)=session.try_lock(){let _=idle.child.kill();}
+                    for session in session {if let Ok(mut idle)=session.try_lock(){let _=idle.child.kill();}}
                     false
                 }else{true}
             });
@@ -662,6 +665,9 @@ impl RemoteExecutor for RemoteExecutorImpl {
         {
             // Unix fallback: direct TCP through the in-process ssh2 client.
             let session = create_session(&workspace.connection, self.timeout).await?;
+            let command=command.to_string();let cwd=cwd.to_path_buf();let env=env.clone();
+            let workspace_id=workspace.id;let limit=self.max_output_bytes;
+            tokio::task::spawn_blocking(move || {
             let mut channel = session
                 .channel_session()
                 .map_err(|e| CoreError::Connection(format!("Failed to open channel: {}", e)))?;
@@ -669,9 +675,9 @@ impl RemoteExecutor for RemoteExecutorImpl {
                 .exec(&script)
                 .map_err(|e| CoreError::Connection(format!("Failed to exec command: {}", e)))?;
             let (stdout, stdout_truncated) =
-                read_stream_with_limit(&mut channel, false, self.max_output_bytes)?;
+                read_stream_with_limit(&mut channel, false, limit)?;
             let (stderr, stderr_truncated) =
-                read_stream_with_limit(&mut channel, true, self.max_output_bytes)?;
+                read_stream_with_limit(&mut channel, true, limit)?;
             channel.wait_close().map_err(|e| {
                 CoreError::Connection(format!("Failed to wait for channel close: {}", e))
             })?;
@@ -680,7 +686,7 @@ impl RemoteExecutor for RemoteExecutorImpl {
 
             Ok(ExecutionRecord {
                 id,
-                workspace_id: workspace.id,
+                workspace_id,
                 triggered_by: agent,
                 command: command.to_string(),
                 working_dir: cwd.to_path_buf(),
@@ -694,6 +700,7 @@ impl RemoteExecutor for RemoteExecutorImpl {
                 remote_stdout_path: None,
                 remote_stderr_path: None,
             })
+            }).await.map_err(|error|CoreError::Connection(format!("SSH fallback worker failed: {error}")))?
         }
     }
 

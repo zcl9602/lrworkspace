@@ -66,8 +66,8 @@ pub enum NodeExecutionMode {
     #[default]
     Unconfirmed,
     /// The SSH endpoint is a login/submission node. Workloads are submitted to
-    /// the scheduler unless this request explicitly names an authorized compute
-    /// SSH target. Control-plane queries and file transfers still use this endpoint.
+    /// a discovered idle compute node through SSH, or to the scheduler when
+    /// requested/unavailable. Workloads never run on this login endpoint.
     SubmitOnly,
     /// Standalone-server mode (legacy storage name). The user confirmed computation on
     /// the SSH endpoint.
@@ -529,11 +529,11 @@ impl ClusterScheduler {
 pub struct NodeInfo {
     /// Node hostname.
     pub hostname: String,
-    /// CPU cores available.
+    /// Reported CPU cores (0 means unavailable, not an observed single core).
     pub cpu_cores: u32,
-    /// Total memory in MB.
+    /// Reported memory in MB (0 means unavailable).
     pub memory_mb: u64,
-    /// GPU count (0 if none).
+    /// Reported GPU count (0 if none or unreported).
     pub gpu_count: u32,
     /// GPU model name if available.
     pub gpu_model: Option<String>,

@@ -85,8 +85,8 @@ Cygwin SSH 和 Win32 SSH agent 不保证互通。配套 SSH 读取用户 SSH con
 
 | 工作区节点模式 | 默认执行 | 限制 |
 |---|---|---|
-| `submit_only` | cluster | 默认提交；本次显式指定 compute-node 时 SSH 到该计算节点；拒绝 direct |
-| `single_server`（存储兼容 `direct_compute`） | direct | 单服务器模式；CLI 配置用 `--node-mode single-server` |
+| `submit_only` | cluster | 自动发现可用计算节点并 SSH；不可用时调度提交；拒绝登录节点 direct |
+| `single_server`（存储兼容 `direct_compute`） | cluster | 允许显式 `--force direct`；CLI 配置用 `--node-mode single-server` |
 | `unconfirmed` | 拒绝 workload | 先确认节点角色；仍可用只读查询 |
 
 单次请求只保留三种入口：
@@ -97,7 +97,7 @@ rw run --workspace research --force direct --timeout-secs 300 -- bash scripts/te
 rw ro --workspace research -- squeue -u alice
 ```
 
-`cluster` 默认经 Slurm/PBS 提交；明确允许从登录节点进入某计算节点时，使用 `rw run --workspace research --force cluster --compute-node compute01 -- bash scripts/run.sh`。MCP `workspace_run` 对应 `"force":"cluster","compute_node":"compute01"`。该授权只限本次，不自动选节点，不回落登录节点，也不在 SSH 失败后重提作业。不可混用 batch 资源参数。旧 `--force compute-node` 仅是 cluster 别名。`direct` 是单服务器执行；`read-only`/`rw ro` 只接受白名单查询。详见 [cluster 双路径](docs/cluster-execution.md)。
+`cluster` 默认重新发现空闲计算节点并探测 SSH，自动选择可用节点，无需用户指定；没有可用节点时提交 Slurm/PBS。可用 `--compute-node compute01` 指定节点，`--execution-path submit` 强制提交。MCP 对应 `compute_node` 和 `execution_path`；发送实际命令后发生 SSH 异常不会回落登录节点或重复提交。batch 资源参数强制提交。`direct` 是单服务器执行，`read-only` / `rw ro` 是白名单轻量查询。详见 [执行与独立任务](docs/cluster-execution.md)。
 
 `working_dir` 必须在 work 根内且存在。命令仍有 SSH 账户真实权限，没有 OS 沙箱，调用方必须限制持久写入在 work 根内。
 
@@ -140,7 +140,7 @@ rw audit --workspace research --limit 100
 
 work/data 读取默认限制 1 MiB，超限需在远端生成小型摘要。索引在登录节点使用 Git 已跟踪及未忽略路径；非 Git 根拒绝递归索引。已知路径读取不要求先索引。`find`、`rg`、`sort` 等不属于只读命令入口，需要时按 workload 运行。
 
-诊断 wait 默认预算 120 秒，可通过 timeout_sec 增大，未结束返回 still_running，证据不足返回 unknown，只有已知终态产生 final_state。当前服务串行处理请求；SSH 查询和诊断收尾可能超出轮询预算。未知、队列消失和空日志都不能代替完成证据。
+诊断 wait 默认预算 120 秒，可通过 timeout_sec 增大，未结束返回 still_running，证据不足返回 unknown，只有已知终态产生 final_state。服务并发处理请求，单个 wait 不阻塞其他命令和监控；SSH 查询和诊断收尾仍可能超出轮询预算。未知、队列消失和空日志都不能代替完成证据。
 
 `rw env` 会更新远端 `~/.bin_path_file`，是 work 根外的明确 LRW 元数据写入。远端 startup 脚本行为和 watchdog 降级需在具体服务器验证。
 
@@ -173,3 +173,18 @@ rw run --workspace research --force cluster --pbs-flavor torque --queue batch --
 ```
 
 PBS 日志路径通过真正的 qsub 参数传递；简单路径也保留无引号的脚本指令。Torque 使用 out/scheduler、err/scheduler 前缀，数组子任务附加的索引仍留在对应日志目录中。含空格/引号的复杂路径依赖 LRW 提交参数，手动 qsub 导出脚本时需自行传入 -o/-e。
+
+## 独立后台命令（0.6.0）
+
+MCP `workspace_run` 默认返回独立 `task_id`，可连续或并发启动多个任务。用 `workspace_task_status` 查实时状态与退出码，`workspace_task_logs` 查日志尾部，`workspace_tasks` 列出当前工作区句柄。需要同步输出时设 `background:false`。调度提交仍使用 `job_id` 及原有 scheduler 工具。
+
+```text
+rw run --workspace research --background -- bash scripts/a.sh
+rw run --workspace research --background -- bash scripts/b.sh
+rw tasks --workspace research
+rw tasks --workspace research --id <UUID> --logs
+```
+
+CLI 保留默认前台输出。后台任务的 SSH 启动/监控请求仍默认等待 120 秒，但任务本身不会因此被截断。独立脚本与 stdout/stderr 保存在 work 根的 `._lrworkspace_tasks/<task_id>/`，MCP 重启后仍可查询；日志读取默认每路 16 KiB、最多 64 KiB。unknown 不算成功，不应盲目重跑。
+
+0.6.0 起所有 workload 默认 cluster，包括旧 `direct_compute` 注册。确认的单服务器可显式用 `--force direct` / `force:"direct"`，登录节点禁止 direct。

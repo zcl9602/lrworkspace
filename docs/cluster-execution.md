@@ -1,34 +1,46 @@
-# Cluster 的两条执行路径（0.3.1）
+# Cluster 执行与独立任务（0.6.0）
 
-`cluster` 表示在集群计算节点工作，`direct` 表示单服务器执行。登录节点仍负责查询、文件访问和中转，不运行 workload。
+`cluster` 在集群计算节点运行任务；登录节点只负责轻量查询、文件访问、中转和提交。`direct` 仅用于已确认的单服务器。所有 workload 默认 cluster，包括旧 `direct_compute` 注册。单服务器需显式选择 direct，未确认角色的端点仍拒绝 workload。
 
-| 请求 | 实际路径 | 结果 |
-|---|---|---|
-| `run --force cluster` | 登录节点 → Slurm/PBS → 分配的计算节点 | job_id，后续查状态和日志 |
-| `run --force cluster --compute-node compute01` | 登录节点 → SSH compute01 → 执行命令 | stdout、stderr、退出码 |
-| `run --force direct` | 已确认的单服务器 → 执行命令 | stdout、stderr、退出码 |
+| 请求 | 实际路径 |
+|---|---|
+| `run --force cluster` | 重新发现 Slurm/PBS 空闲节点，探测第二跳 SSH，选择可达节点运行；没有合适节点时提交调度器 |
+| `run --force cluster --execution-path submit` | 登录节点提交 Slurm/PBS，任务在分配的计算节点运行 |
+| `run --force cluster --compute-node compute01` | 经登录节点 SSH 到指定计算节点，不自动重提 |
+| `run --force direct` | 已确认的单服务器执行 |
 
-```text
-rw run --workspace research --force cluster --cpu 4 -- bash scripts/run.sh
-rw run --workspace research --force cluster --compute-node compute01 --timeout-secs 300 -- bash scripts/run.sh
-```
+自动选择依据本次调度器发现结果，只选择 `idle/free` 节点，遵守已保存的允许队列限制，排除未知、占用、离线和登录端点。多个请求分散选择候选节点；最多探测四个节点。探测只核对主机与工作目录，不运行用户 workload。第二跳在执行前对比实际主机名，别名回到登录节点也会拒绝。
 
-MCP 调用 `workspace_run`：
+自动选择无需每次由用户提供计算节点名称。可用 `execution_path=ssh` / `--execution-path ssh` 要求必须 SSH，找不到节点就报错。显式 `batch` / CLI batch 资源参数强制调度提交；SSH 与 batch 资源不能混用。`workspace_submit` / `rw submit` 始终保留原有 Slurm、PBS Pro/OpenPBS、Torque 命令数组模式。
+
+SSH 使用登录账户已有的非交互认证，不转发本机 agent、不跳过主机密钥验证、不自动输入第二跳密码。它不申请调度器配额；要求资源分配的站点应使用 `execution_path=submit`。计算节点须能访问同一 work 路径，并提供 bash、hostname、realpath。后台任务另需 Linux setsid、nohup、tail 和 base64。
+
+## 并发与监控
+
+MCP 同时接收独立请求，响应按请求 ID 匹配，允许先返回后提交但较快的请求。Windows 同一端点使用多个独立 SSH 会话，不再让一条长命令锁住该主机。前台任务超时只影响自己的会话；ping、客户端表单与其他任务互不等待。
+
+MCP `workspace_run` 的 SSH/单服务器 workload 默认 `background:true`：
 
 ```json
-{"workspace_id":"research","force":"cluster","compute_node":"compute01","command":"bash scripts/run.sh","timeout_sec":300}
+{"workspace_id":"research","force":"cluster","command":"bash scripts/a.sh"}
+{"workspace_id":"research","force":"cluster","command":"bash scripts/b.sh"}
 ```
 
-只有用户明确允许 SSH 进入某计算节点时，agent 才可填写 `compute_node`；参数是这次请求的显式选择，不持久授权，不扫描或自动选空闲节点。省略则走原有数组提交。`workspace_submit` / `rw submit` 始终生成/提交数组，继续支持 Slurm、PBS Pro/OpenPBS 和 Torque。
+每个请求返回独立 `task_id`。使用 `workspace_task_status(task_id)` 查实时状态、实际 hostname 和退出码，`workspace_task_logs(task_id)` 查两路日志尾部，`workspace_tasks` 列出句柄。列表中的状态是本机最近一次观测，实时状态应单独查询。调度提交仍返回 `job_id`，使用原有 scheduler status/logs 工具监控。
 
-SSH 路径不向调度器申请 CPU/内存，不接受任何 batch 资源参数（MCP 连空 `batch:{}` 也拒绝）。目标节点应是用户允许访问的节点；此参数不能证明拥有调度器资源分配。
+```text
+rw run --workspace research --force cluster --background -- bash scripts/a.sh
+rw run --workspace research --force cluster --background -- bash scripts/b.sh
+rw tasks --workspace research
+rw tasks --workspace research --id <UUID> --logs --max-bytes 16384
+```
 
-登录节点需要 OpenSSH client，且其账户自己的 SSH 配置/密钥已允许到目标节点的非交互认证；不转发本机 agent，不自动跳过主机密钥验证，不提示密码。使用登录节点的 SSH 默认用户、端口或其 Host 配置；参数只收 hostname/IPv4，不收 user@host、IPv6 字面地址或 SSH options。远端需要 bash、hostname、realpath。
+CLI 默认保持前台输出，`--background` 启用后台任务；MCP 可设 `background:false` 等待输出。后台脚本和日志各自存放在远端 work 根下 `._lrworkspace_tasks/<task_id>/`，句柄保存在本机工作区元数据中。任务与日志不会因 MCP 重启或断开而自动删除。重连后重新认证即可用原句柄查询。
 
-工作目录仍须位于 work 根，计算节点上会重新解析真实路径并检查边界，目录缺失或指向根外时拒绝运行；两端需能访问同一 work 路径。显式目标不能等于登录端点，并在第二跳比对实际短主机名，防止别名误连回登录节点。短名相同但域名不同也会保守拒绝。
+日志默认每路最多读取最近 16 KiB，可设 `max_bytes` / `--max-bytes`，上限为每路 64 KiB；报告截断，不把整份日志载入内存。状态区分 starting、running、succeeded、failed、unknown；只有明确的退出码文件证明完成，空日志、PID 消失或连接失败不算成功。
 
-SSH 失败、路径错误或命令失败不会回落登录节点，也不会改走调度器。响应标明 `mode:"cluster"` 和 `execution_path:"ssh"` / `"submit"`；SSH 响应带 `compute_node` 和原始命令的执行记录，CLI 返回实际命令退出码。审计保留路径和目标节点。
+默认 SSH 操作预算仍为 120 秒，CLI `--timeout-secs` / MCP `timeout_sec` 可修改。后台任务寿命不受这次 SSH 等待预算限制；调度作业的时间限制由调度器资源配置决定。
 
-默认等待 120 秒，可通过上述参数修改。这是命令执行接口，不提供交互式终端。连接超时/中断不应被当作任务从未执行；重试前核对远端输出，避免重复执行。
+启动前先落盘句柄。发送 workload 后发生连接异常时返回可查询的 `task_id` 和 unknown 状态，不重新启动、不切换节点重跑、不回落登录节点。只有尚未发送 workload 的自动探测失败，才可换候选节点或选择调度提交。
 
-节点角色配置：集群登录节点继续用 CLI `--node-mode submit-only` / MCP `submit_only`；单服务器新增 CLI `--node-mode single-server` / MCP `single_server`，兼容旧 `direct-compute` / `direct_compute`，落盘名称不变，不需迁移已有注册。
+节点配置继续使用 CLI `--node-mode submit-only` / MCP `submit_only` 表示集群登录端点；这是保留的存储名称，不代表任务必须仅用调度器。单服务器使用 `single-server` / `single_server`，兼容旧 `direct-compute` / `direct_compute`。
