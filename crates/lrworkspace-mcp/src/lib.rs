@@ -1133,6 +1133,7 @@ impl McpServer {
             .collect();
         Ok(serde_json::json!({
             "architecture": "remote-first-no-sync",
+            "server_version": env!("CARGO_PKG_VERSION"),
             "local_platform": std::env::consts::OS,
             "local_arch": std::env::consts::ARCH,
             "local_data_dir": self.config.data_dir,
@@ -1224,12 +1225,14 @@ impl McpServer {
                 if execution_path=="ssh" && has_batch {
                     return Err(CoreError::Validation("SSH cannot be combined with scheduler batch resources".into()));
                 }
+                let mut selection=None;
                 let selected=if let Some(node)=compute_node {Some(lrworkspace_remote::compute_ssh::verify_compute_node(&executor,&self.config,workspace,node).await?)}
                     else if execution_path!="submit" && !has_batch {
-                        lrworkspace_remote::compute_ssh::choose_compute_node(&executor,&self.config,workspace).await?
+                        let report=lrworkspace_remote::compute_ssh::choose_compute_node_detailed(&executor,&self.config,workspace).await?;
+                        let node=report.node.clone();selection=Some(report);node
                     } else {None};
                 if selected.is_none() && execution_path=="ssh" {
-                    return Err(CoreError::NotFound("No reachable idle compute node; workload was not started".into()));
+                    return Err(CoreError::NotFound(format!("No reachable idle compute node; workload was not started; {}",selection.as_ref().map(|report|report.summary()).unwrap_or_default())));
                 }
                 if let Some(node)=selected {
                     if args.get("background").and_then(Value::as_bool).unwrap_or(true) {
@@ -1249,8 +1252,10 @@ impl McpServer {
                         }
                     };
                     let commands=[BatchCommand {source_line:1,command:command.into()}];
-                    let result=submit_batch(Arc::new(executor),&self.config,workspace,&cluster,&commands,&batch_options(args)?,working_dir.as_deref(),true,agent).await?;
-                    let mut value=serde_json::to_value(result)?;value["mode"]=serde_json::json!("cluster");value["execution_path"]=serde_json::json!("submit");value
+                    let result=submit_batch(Arc::new(executor),&self.config,workspace,&cluster,&commands,&batch_options(args)?,working_dir.as_deref(),true,agent).await
+                        .map_err(|error|match &selection {Some(report)=>CoreError::Connection(format!("{}; scheduler fallback failed: {error}",report.summary())),None=>error})?;
+                    let mut value=serde_json::to_value(result)?;value["mode"]=serde_json::json!("cluster");value["execution_path"]=serde_json::json!("submit");
+                    if let Some(report)=selection {value["compute_selection"]=serde_json::to_value(report)?;} value
                 }
             }
             ExecutionRoute::Direct => {

@@ -24,6 +24,8 @@ Cursor 用 `--client cursor`，两个客户端用 `--client all`。默认只配�
 
 已有 LRW MCP 的旧程序路径会更新，保留其他服务、环境变量、较长超时及 Codex 注释；修改前在原配置旁保存 `.bak`，损坏配置或自定义不兼容参数会停止安装。相同版本的不同构建使用新的 `--install-dir <绝对路径>`。旧程序、工作区和任务不删除。当前请求结束后重新连接 MCP。
 
+升级验收以新会话 `workspace_discover.server_version` 为准，不能只看磁盘程序的 `--version`。0.6.5 起该字段直接报告实际运行的 MCP 版本。同一台电脑的不同客户端可以同时持有旧进程；有些客户端还会保留启动时的配置。若重连后仍是旧版，先结束当前工具调用并完整退出客户端（包括托盘驻留），再核对/更新其 MCP 程序路径并重新打开；不要删除工作区注册或远端作业。修改配置与验证新进程启动成功，并不代表所有已运行客户端已经切换。
+
 Codex 使用 `$CODEX_HOME/config.toml`（未设时为用户 `.codex/config.toml`）；Cursor 使用用户 `.cursor/mcp.json`。其它 MCP 客户端用 `rw mcp show` 获取配置示例，并注册 `lrworkspace-mcp` 的绝对路径。
 
 默认命令预算 120 秒，CLI `--timeout-secs`、MCP `timeout_sec` 可改。安装时 Codex `tool_timeout_sec` 至少为命令预算加 30 秒（默认 150 秒），保留更大值。客户端或电脑连接层自己的等待限制需独立配置；客户端等待超时不代表提交失败，先查询作业状态，避免重复提交。

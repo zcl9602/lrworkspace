@@ -41,6 +41,13 @@ fn main() {
             let host=if compute {std::env::var("LRW_TEST_TARGET_HOST").unwrap_or_else(|_|"compute01".into())} else {"login-fixture".into()};
             println!("{host}");
         }
+        "getent"=>{
+            // This executable prevents fixture tests from making real DNS requests.
+            if let Ok(name)=std::env::var("LRW_TEST_CANONICAL_HOST") {
+                println!("192.0.2.11 STREAM {name}");
+                println!("192.0.2.11 DGRAM");
+            } else {std::process::exit(2);}
+        }
         "ssh"=>{
             if std::env::var_os("LRW_TEST_BLOCK_STDIN").is_some(){std::thread::sleep(std::time::Duration::from_secs(4));return;}
             if args.iter().any(|arg|arg=="-n") {
@@ -49,7 +56,9 @@ fn main() {
                 writeln!(log,"{:?}",args).unwrap();
                 if std::env::var_os("LRW_TEST_COMPUTE_FAILURE").is_some() {eprintln!("test compute SSH unavailable");std::process::exit(255);}
                 let remote=format!("export PATH=\"$LRW_TEST_BIN_POSIX:$PATH\"\n{}",args.last().unwrap().replacen("bash -lc ","bash --noprofile --norc -c ",1));
-                let status=std::process::Command::new(std::env::var_os("LRW_TEST_BASH").unwrap()).args(["--noprofile","--norc","-c",&remote]).env("LRW_TEST_ON_COMPUTE","1").status().unwrap();
+                let peer=std::env::var("LRW_TEST_SERVER_IP").unwrap_or_else(|_|"192.0.2.11".into());
+                let status=std::process::Command::new(std::env::var_os("LRW_TEST_BASH").unwrap()).args(["--noprofile","--norc","-c",&remote]).env("LRW_TEST_ON_COMPUTE","1")
+                    .env("SSH_CONNECTION",format!("192.0.2.1 12345 {peer} 22")).status().unwrap();
                 std::process::exit(status.code().unwrap_or(1));
             }
             let mut command=std::process::Command::new(std::env::var_os("LRW_TEST_BASH").expect("test bash"));

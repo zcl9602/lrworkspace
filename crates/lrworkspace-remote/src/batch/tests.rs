@@ -95,6 +95,7 @@ fn pbs_dialects_preserve_total_tasks_threads_and_throttle() {
     assert_eq!(PbsFlavor::detect("TORQUE version 6.1"),Some(PbsFlavor::Torque));
     assert!(PbsFlavor::detect("unknown build").is_none());
     assert_eq!(PbsFlavor::detect("Version: 6.1.3\nCommit: fixture"),Some(PbsFlavor::Torque));
+    assert_eq!(PbsFlavor::detect("Version: 4.2.7\nCommit: fixture"),Some(PbsFlavor::Torque));
     assert_eq!(PbsFlavor::detect("usage: qsub [-j join] [-J range] [script]"),Some(PbsFlavor::PbsPro));
     assert_eq!(PbsFlavor::detect("usage: qsub [-j join] [-t range] [script]"),Some(PbsFlavor::Torque));
     for ambiguous in ["pbs_version = 6.1.3", "usage: qsub [-j join] [script]",

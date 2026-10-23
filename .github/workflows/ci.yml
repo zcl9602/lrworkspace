@@ -57,6 +57,8 @@ jobs:
         run: |
           cargo test -p lrworkspace-cli --test native_batch mcp_path_hints --locked -- --ignored --nocapture
           cargo test -p lrworkspace-cli --test native_batch mcp_pbs_run --locked -- --ignored --nocapture
+      - name: Verify compute DNS aliases and active MCP version
+        run: cargo test -p lrworkspace-cli --test native_batch mcp_compute_dns --locked -- --ignored --nocapture
       - name: Run independent MCP commands and durable task monitoring
         run: cargo test -p lrworkspace-cli --test native_batch mcp_concurrent --locked -- --ignored --nocapture
       - name: Run MCP bounded-output session regression
