@@ -23,6 +23,38 @@ pub struct BatchSubmission {
     pub warning:Option<String>,
 }
 
+#[derive(Serialize,Deserialize)]
+struct PbsSettings { endpoint:String, flavor:PbsFlavor }
+
+fn scheduler_endpoint(workspace:&Workspace)->CoreResult<String> {
+    // Include connection identity, never authentication material. Changing an
+    // endpoint or jump route invalidates this workspace's cached choice.
+    let connection=&workspace.connection;
+    let jumps:Vec<_>=connection.jump_hosts.iter().map(|jump|(&jump.host,&jump.user,jump.port)).collect();
+    Ok(serde_json::to_string(&(&connection.host,&connection.user,connection.port,jumps))?)
+}
+
+async fn resolve_pbs_flavor(executor:&RemoteExecutorImpl,config:&LrWorkspaceConfig,workspace:&Workspace,
+    explicit:Option<PbsFlavor>)->CoreResult<PbsFlavor> {
+    if let Some(flavor)=explicit {return Ok(flavor);}
+    let endpoint=scheduler_endpoint(workspace)?;
+    if let Some(settings)=workspace_store::load_scheduler_settings(config,workspace.id).ok().flatten()
+        .and_then(|value|serde_json::from_value::<PbsSettings>(value).ok()).filter(|settings|settings.endpoint==endpoint) {
+        return Ok(settings.flavor);
+    }
+    let started=Instant::now();
+    for probe in ["qsub --version </dev/null 2>&1", "qstat --version </dev/null 2>&1",
+                  "qsub --help </dev/null 2>&1", "qstat -Bf </dev/null 2>&1"] {
+        let budget=executor.timeout().checked_sub(started.elapsed()).filter(|budget|!budget.is_zero())
+            .ok_or_else(||CoreError::Timeout("PBS identification exceeded its operation budget; no workload was submitted".into()))?;
+        let version=executor.with_timeout(budget).execute_scheduler_control(workspace,probe,None,&Default::default()).await?;
+        if !version.output_truncated {
+            if let Some(flavor)=PbsFlavor::detect(&format!("{}\n{}",version.stdout,version.stderr)) {return Ok(flavor);}
+        }
+    }
+    Err(CoreError::Validation("PBS type remains unknown after read-only version/usage/server probes; no workload was submitted. Set batch.pbs_flavor=pbs-pro or torque once (CLI: --pbs-flavor); the choice is saved for this workspace".into()))
+}
+
 pub async fn submit_batch(executor:Arc<RemoteExecutorImpl>, config:&LrWorkspaceConfig,
     workspace:&Workspace, cluster:&ClusterConfig, commands:&[BatchCommand], options:&BatchOptions,
     working_dir:Option<&Path>, submit:bool, agent:&AgentKind) -> CoreResult<BatchSubmission> {
@@ -36,17 +68,17 @@ pub async fn submit_batch(executor:Arc<RemoteExecutorImpl>, config:&LrWorkspaceC
     let remaining=||executor.timeout().checked_sub(started.elapsed()).filter(|budget|!budget.is_zero())
         .ok_or_else(||CoreError::Timeout("Batch preparation/submission exceeded its operation budget; preserved run files must be inspected before retrying".into()));
     let mut options=options.clone();
-    if cluster.scheduler==ClusterScheduler::Pbs && options.pbs_flavor.is_none() {
-        let version=executor.with_timeout(remaining()?).execute_scheduler_control(workspace,"qsub --version 2>&1",None,&Default::default()).await?;
-        options.pbs_flavor=PbsFlavor::detect(&format!("{}\n{}",version.stdout,version.stderr));
-        if options.pbs_flavor.is_none() {
-            return Err(CoreError::Validation("Cannot distinguish PBS Pro/OpenPBS from Torque; specify pbs_flavor=pbs-pro or torque".into()));
-        }
+    if cluster.scheduler==ClusterScheduler::Pbs {
+        options.pbs_flavor=Some(resolve_pbs_flavor(&executor.with_timeout(remaining()?),config,workspace,options.pbs_flavor).await?);
     }
     // Validate user input before any permanent run directory is created.
     let run_relative=new_run_relative(&options)?;
     let provisional=lrworkspace_core::safety::safe_join(&workspace.remote_work_dir,&run_relative)?;
     let _=BatchPlan::prepare(commands,&options,cluster.scheduler.clone(),run_relative.clone(),&provisional)?;
+    let settings_warning=if let Some(flavor)=options.pbs_flavor.filter(|_|cluster.scheduler==ClusterScheduler::Pbs) {
+        workspace_store::save_scheduler_settings(config,workspace.id,&PbsSettings {endpoint:scheduler_endpoint(workspace)?,flavor})
+            .err().map(|error|format!("PBS type was resolved, but saving the workspace choice failed: {error}"))
+    } else {None};
     let prefix=RemoteExecutorImpl::build_mcp_command(workspace,"",working_dir,&Default::default())?;
     let target=executor.with_timeout(remaining()?).validate_mcp_write_target(workspace,&run_relative.join("bundle.tar")).await?;
     let target=normalize_remote_absolute(&target)?;
@@ -69,7 +101,7 @@ pub async fn submit_batch(executor:Arc<RemoteExecutorImpl>, config:&LrWorkspaceC
         shell_quote(&target),shell_quote(run_directory));
     let record=executor.with_timeout(remaining()?).execute_control(workspace,&extract,None,&Default::default()).await?;
     if record.exit_code!=Some(0) {return Err(CoreError::Connection(format!("Batch extraction failed; files retained at {}: {}",run_directory,record.stderr)));}
-    let mut result=BatchSubmission {status:"generated".into(),batch:summary,job:None,job_id:None,warning:None};
+    let mut result=BatchSubmission {status:"generated".into(),batch:summary,job:None,job_id:None,warning:settings_warning};
     if !submit {return Ok(result);}
     let executor=Arc::new(executor.with_timeout(remaining()?));
     let mut job=match cluster.scheduler {

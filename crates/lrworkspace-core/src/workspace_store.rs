@@ -207,6 +207,20 @@ pub fn save_cluster_config(
     Ok(())
 }
 
+/// Stable scheduler choices are separate from frequently refreshed node inventory.
+pub fn load_scheduler_settings(config:&LrWorkspaceConfig,id:WorkspaceId)->CoreResult<Option<serde_json::Value>> {
+    let path=workspaces_dir(config).join(format!("{id}.scheduler.json"));
+    match std::fs::read_to_string(path) {
+        Ok(payload)=>Ok(Some(serde_json::from_str(&payload)?)),
+        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>Ok(None),
+        Err(error)=>Err(error.into()),
+    }
+}
+
+pub fn save_scheduler_settings(config:&LrWorkspaceConfig,id:WorkspaceId,value:&impl serde::Serialize)->CoreResult<()> {
+    write_json_atomic(&workspaces_dir(config).join(format!("{id}.scheduler.json")),value)
+}
+
 pub fn save_env_snapshot(config: &LrWorkspaceConfig, snapshot: &EnvSnapshot) -> CoreResult<()> {
     std::fs::create_dir_all(workspaces_dir(config))?;
     write_json_atomic(&env_path(config, snapshot.workspace_id), snapshot)?;

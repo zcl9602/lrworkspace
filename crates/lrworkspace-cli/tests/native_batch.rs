@@ -14,7 +14,7 @@ impl Fixture {
         let source=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_scheduler.rs");
         let compiled=Command::new("rustc").arg(source).arg("-o").arg(&executable).output().unwrap();
         assert!(compiled.status.success(),"{}",String::from_utf8_lossy(&compiled.stderr));
-        for program in ["ssh","scp","rsync","sbatch","qsub","hostname","sinfo"] {
+        for program in ["ssh","scp","rsync","sbatch","qsub","qstat","hostname","sinfo"] {
             let name=if cfg!(windows){format!("{program}.exe")}else{program.into()};
             std::fs::copy(&executable,root.join("bin").join(name)).unwrap();
         }
@@ -46,6 +46,7 @@ impl Fixture {
         command.env("PATH",std::env::join_paths(paths).unwrap())
             .env("LRW_TEST_TRANSFER_LOG",self.root.join("transfers.log"))
             .env("LRW_TEST_POLL_ROOT",&self.root)
+            .env("LRW_TEST_PBS_PROBE_LOG",self.root.join("pbs-probes.log")).env_remove("LRW_TEST_PBS_VERSION")
             .env("LRWORKSPACE_SSH",self.root.join("bin").join(if cfg!(windows){"ssh.exe"}else{"ssh"})).env("LRWORKSPACE_SCP",self.root.join("bin").join(if cfg!(windows){"scp.exe"}else{"scp"}))
             .env("LRWORKSPACE_CONFIG",self.root.join("config.toml")).env("LRWORKSPACE_DATA_DIR",&self.config.data_dir)
             .env("LRWORKSPACE_RSYNC",self.root.join("bin").join(if cfg!(windows){"rsync.exe"}else{"rsync"}))
@@ -94,6 +95,42 @@ fn pbs_cli_detects_openpbs_and_keeps_server_and_array_job_id() {
     let script=std::fs::read_to_string(f.root.join("work").join(result["batch"]["script_relative"].as_str().unwrap())).unwrap();
     assert!(script.contains("#PBS -J 1-3%2"));assert!(!script.contains("#PBS -l mem="));
     assert!(workspace_store::load_job_record(&f.config,f.workspace.id,"4243[].server").unwrap().is_some());
+}
+
+#[test]
+fn pbs_detection_handles_torque_stderr_usage_and_server_fallback_without_retrying_a_job() {
+    for (mode,flavor,expected_probe) in [("torque-bare","torque","qsub --version"),
+        ("fallback-torque","torque","qstat --version"),("help-pro","pbs-pro","qsub --help"),
+        ("help-torque","torque","qsub --help"),("server-pro","pbs-pro","qstat -Bf")] {
+        let Some(f)=Fixture::new(ClusterScheduler::Pbs) else{return};
+        let result=success(f.command().env("LRW_TEST_PBS_VERSION",mode).args(["submit","--workspace","fixture","--in","commands.sh","--timeout-secs","30","--submit"]).output().unwrap());
+        assert_eq!(result["batch"]["pbs_flavor"],flavor,"{mode}");
+        assert_eq!(std::fs::read_to_string(f.root.join("submissions.log")).unwrap().lines().count(),1,"{mode}");
+        let probes=std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap();assert!(probes.contains(expected_probe),"{mode}: {probes}");
+        // A new client process reuses the workspace choice even if the wrapper
+        // subsequently hides every version/help response.
+        let second=success(f.command().env("LRW_TEST_PBS_VERSION","unknown").args(["submit","--workspace","fixture","--in","commands.sh","--timeout-secs","30"]).output().unwrap());
+        assert_eq!(second["batch"]["pbs_flavor"],flavor);
+        assert_eq!(std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap(),probes);
+    }
+}
+
+#[test]
+fn pbs_unknown_is_safe_and_an_explicit_choice_is_remembered_but_not_for_another_endpoint() {
+    let Some(f)=Fixture::new(ClusterScheduler::Pbs) else{return};
+    let output=f.command().env("LRW_TEST_PBS_VERSION","unknown").args(["submit","--workspace","fixture","--in","commands.sh","--submit"]).output().unwrap();
+    assert!(!output.status.success());assert!(!f.root.join("submissions.log").exists());
+    assert!(!f.root.join("work/._lrworkspace_jobs").exists());
+    let result=success(f.command().env("LRW_TEST_PBS_VERSION","unknown").args(["submit","--workspace","fixture","--in","commands.sh","--pbs-flavor","torque","--submit"]).output().unwrap());
+    assert_eq!(result["batch"]["pbs_flavor"],"torque");
+    let probes=std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap();
+    let cached=success(f.command().env("LRW_TEST_PBS_VERSION","unknown").args(["submit","--workspace","fixture","--in","commands.sh"]).output().unwrap());
+    assert_eq!(cached["batch"]["pbs_flavor"],"torque");
+    assert_eq!(std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap(),probes);
+    let mut workspace=f.workspace.clone();workspace.connection.port=2222;workspace_store::save_workspace(&f.config,&workspace).unwrap();
+    let changed=f.command().env("LRW_TEST_PBS_VERSION","unknown").args(["submit","--workspace","fixture","--in","commands.sh"]).output().unwrap();
+    assert!(!changed.status.success());
+    assert_eq!(std::fs::read_to_string(f.root.join("submissions.log")).unwrap().lines().count(),1);
 }
 
 #[test]
@@ -189,7 +226,7 @@ fn mcp_cluster_ssh_uses_the_same_explicit_node_route() {
     for request in [
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"ssh-test"}}}),
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","command":"hostname -s; exit 9","force":"cluster","compute_node":"compute01","timeout_sec":30}}}),
-        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","command":"touch should-not-run","force":"cluster","compute_node":"compute01","batch":{}}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_run","arguments":{"background":false,"workspace_id":"fixture","command":"touch should-not-run","force":"cluster","compute_node":"compute01","batch":{"cpu":1}}}}),
     ] {writeln!(input,"{request}").unwrap();}
     drop(input);let output=child.wait_with_output().unwrap();assert!(output.status.success());
     let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect(); responses.sort_by_key(|v|v["id"].as_u64());
@@ -268,6 +305,9 @@ struct McpClient {
 }
 impl McpClient {
     fn new(f:&Fixture, automatic_nodes:bool)->Self {
+        Self::with_pbs_version(f,automatic_nodes,None)
+    }
+    fn with_pbs_version(f:&Fixture, automatic_nodes:bool,pbs_version:Option<&str>)->Self {
         use std::io::BufRead;
         use std::process::Stdio;
         let binary=Path::new(env!("CARGO_BIN_EXE_rw")).parent().unwrap()
@@ -275,6 +315,7 @@ impl McpClient {
         assert!(binary.is_file(),"Build the matching MCP binary first");
         let mut command=f.command_for(&binary);
         if automatic_nodes {command.env("LRW_TEST_IDLE_COMPUTE","1");}
+        if let Some(version)=pbs_version {command.env("LRW_TEST_PBS_VERSION",version);}
         let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
         let input=child.stdin.take();let stdout=child.stdout.take().unwrap();
         let (sender,output)=std::sync::mpsc::channel();
@@ -306,6 +347,61 @@ impl McpClient {
 }
 impl Drop for McpClient {
     fn drop(&mut self){self.input.take();let _=self.child.kill();let _=self.child.wait();}
+}
+
+#[test]
+#[ignore="requires matching MCP binary; verifies compatibility paths on local fake compute hosts"]
+fn mcp_path_hints_do_not_require_a_failed_first_call_or_allow_login_workloads() {
+    let Some(mut f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let mut client=McpClient::new(&f,true);
+    for (index,path) in [serde_json::Value::Null,serde_json::json!("auto"),serde_json::json!("cluster"),
+        serde_json::json!("ssh"),serde_json::json!("compute-node"),serde_json::json!("direct")].into_iter().enumerate() {
+        client.call(2+index as u64,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"cluster",
+            "execution_path":path,"background":false,"command":"hostname -s","timeout_sec":30}));
+        let result=client.result();assert_eq!(result["mode"],"cluster");assert_eq!(result["execution_path"],"ssh");
+        assert_eq!(result["result"]["stdout"],"compute01\n");
+    }
+    for batch in [serde_json::Value::Null,serde_json::json!({})] {
+        client.call(18,"workspace_run",serde_json::json!({"workspace_id":"fixture","batch":batch,
+            "background":false,"command":"hostname -s","timeout_sec":30}));
+        assert_eq!(client.result()["result"]["stdout"],"compute01\n");
+    }
+    assert!(!f.root.join("submissions.log").exists());
+    client.call(20,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct",
+        "execution_path":"ssh","background":false,"command":"touch forbidden-login-workload"}));
+    assert!(client.reply().get("error").is_some());assert!(!f.root.join("work/forbidden-login-workload").exists());
+    client.call(21,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"read-only",
+        "execution_path":"ssh","background":false,"command":"pwd"}));
+    assert_eq!(client.result()["result"]["stdout"],format!("{}\n",f.workspace.remote_work_dir.display()));
+    client.call(22,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"read-only",
+        "execution_path":"ssh","background":false,"command":"touch forbidden-login-workload"}));
+    assert!(client.reply().get("error").is_some());assert!(!f.root.join("work/forbidden-login-workload").exists());
+    drop(client);
+    f.workspace.node_execution_mode=NodeExecutionMode::DirectCompute;workspace_store::save_workspace(&f.config,&f.workspace).unwrap();
+    let mut client=McpClient::new(&f,false);
+    for path in ["ssh","direct"] {
+        client.call(2,"workspace_run",serde_json::json!({"workspace_id":"fixture","force":"direct",
+            "execution_path":path,"background":false,"command":"printf standalone"}));
+        assert_eq!(client.result()["result"]["stdout"],"standalone");
+    }
+}
+
+#[test]
+#[ignore="requires matching MCP binary; checks PBS auto detection and persistence without real submission"]
+fn mcp_pbs_run_identifies_torque_on_the_first_call_and_reuses_it_after_restart() {
+    let Some(f)=Fixture::new(ClusterScheduler::Pbs) else{return};
+    let mut client=McpClient::with_pbs_version(&f,false,Some("fallback-torque"));
+    client.call(2,"workspace_run",serde_json::json!({"workspace_id":"fixture","execution_path":"submit",
+        "command":"printf first-command","timeout_sec":30}));
+    let first=client.result();assert_eq!(first["batch"]["pbs_flavor"],"torque");assert_eq!(first["status"],"submitted");
+    drop(client);
+    let probes=std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap();
+    let mut client=McpClient::with_pbs_version(&f,false,Some("unknown"));
+    client.call(2,"workspace_submit",serde_json::json!({"workspace_id":"fixture","commands_text":"printf second-command",
+        "submit":true,"timeout_sec":30}));
+    assert_eq!(client.result()["batch"]["pbs_flavor"],"torque");
+    assert_eq!(std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap(),probes);
+    assert_eq!(std::fs::read_to_string(f.root.join("submissions.log")).unwrap().lines().count(),2);
 }
 
 #[test]
