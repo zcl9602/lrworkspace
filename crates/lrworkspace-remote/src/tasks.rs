@@ -14,6 +14,48 @@ fn key(id: Uuid) -> String {
     format!("exec-{id}")
 }
 
+fn terminal(task:&Value)->bool {
+    match (task["status"].as_str(),task["exit_code"].as_i64()) {
+        (Some("succeeded"),Some(0))=>true,
+        (Some("failed"),Some(1..=255))=>true,
+        _=>false,
+    }
+}
+
+fn observation_time(task:&Value)->Option<chrono::DateTime<chrono::FixedOffset>> {
+    ["observation_started_at","last_checked_at","created_at"].iter().find_map(|field|
+        task[*field].as_str().and_then(|value|chrono::DateTime::parse_from_rfc3339(value).ok()))
+}
+
+fn merge_observation(previous:Option<Value>,next:Value)->CoreResult<Value> {
+    let Some(previous)=previous else{return Ok(next)};
+    for field in ["kind","task_id","workspace_id","remote_host","remote_user","remote_port","work_root","compute_node"] {
+        if previous[field]!=next[field] {
+            return Err(CoreError::InvalidState("Task identity changed while its state was being updated".into()));
+        }
+    }
+    if terminal(&previous) {
+        // Refresh metadata for the same terminal evidence, but never regress it
+        // or let an older reply replace a newer observation.
+        if terminal(&next) && previous["status"]==next["status"] && previous["exit_code"]==next["exit_code"]
+            && observation_time(&next)>=observation_time(&previous) { return Ok(next); }
+        return Ok(previous);
+    }
+    if terminal(&next) { return Ok(next); }
+    if matches!((observation_time(&previous),observation_time(&next)),(Some(old),Some(new)) if old>new) {
+        return Ok(previous);
+    }
+    Ok(next)
+}
+
+async fn commit_observation(config:&LrWorkspaceConfig,workspace:&Workspace,id:Uuid,next:Value,
+    timeout:std::time::Duration)->CoreResult<Value> {
+    let config=config.clone();let workspace_id=workspace.id;
+    tokio::task::spawn_blocking(move||workspace_store::update_job_record(&config,workspace_id,&key(id),
+        timeout.min(std::time::Duration::from_secs(5)),|previous|merge_observation(previous,next)))
+        .await.map_err(|error|CoreError::InvalidState(format!("Task state worker failed: {error}")))?
+}
+
 fn load(config: &LrWorkspaceConfig, workspace: &Workspace, id: Uuid) -> CoreResult<Value> {
     let task = workspace_store::load_job_record(config, workspace.id, &key(id))?
         .ok_or_else(|| CoreError::NotFound("Unknown task in this workspace".into()))?;
@@ -31,6 +73,7 @@ fn load(config: &LrWorkspaceConfig, workspace: &Workspace, id: Uuid) -> CoreResu
     }
     Ok(task)
 }
+
 
 pub fn list(config: &LrWorkspaceConfig, workspace: &Workspace, limit: usize) -> CoreResult<Value> {
     if !(1..=100).contains(&limit) {
@@ -75,8 +118,10 @@ async fn execute(
     workspace: &Workspace,
     node: Option<&str>,
     script: &str,
+    control: bool,
 ) -> CoreResult<ExecutionRecord> {
     if let Some(node) = node {
+        if control { return executor.execute_compute_control(workspace,node,script).await; }
         executor
             .execute_compute_ssh(workspace, node, script, None)
             .await
@@ -157,8 +202,9 @@ printf 'LRW_TASK_STARTED:{id}\n'
         "status":"starting","created_at":chrono::Utc::now(),"working_dir":cwd,
         "stdout_path":format!("{directory}/stdout"),"stderr_path":format!("{directory}/stderr")});
     // Persist the handle before dispatch so an uncertain launch can be inspected without replaying it.
-    workspace_store::save_job_record(config, workspace.id, &key(id), &task)?;
-    let result = execute(executor, workspace, node, &script).await;
+    task["observation_started_at"]=task["created_at"].clone();
+    task=commit_observation(config,workspace,id,task,executor.timeout()).await?;
+    let result = execute(executor, workspace, node, &script, false).await;
     match result {
         Ok(record)
             if record.exit_code == Some(0)
@@ -177,10 +223,9 @@ printf 'LRW_TASK_STARTED:{id}\n'
     }
     task["instruction"]=json!("Query this task_id for live state and logs. Do not replay an unknown launch. Task survives MCP/SSH disconnects.");
     lrworkspace_core::privacy::redact_value(&mut task);
-    if let Err(error) = workspace_store::save_job_record(config, workspace.id, &key(id), &task) {
-        task["warning"] = json!(format!(
-            "Task handle was created but status update failed: {error}; do not resubmit"
-        ));
+    match commit_observation(config,workspace,id,task.clone(),executor.timeout()).await {
+        Ok(latest)=>task=latest,
+        Err(error)=>task["warning"]=json!(format!("Task handle was created but status update failed: {error}; do not resubmit")),
     }
     Ok(task)
 }
@@ -193,6 +238,7 @@ pub async fn poll(
     log_bytes: Option<usize>,
 ) -> CoreResult<Value> {
     let mut task = load(config, workspace, id)?;
+    let observed_at=chrono::Utc::now();
     let node = task["compute_node"].as_str();
     let directory = format!(
         "{}/._lrworkspace_tasks/{id}",
@@ -228,7 +274,7 @@ if [ -f "$task/hostname" ]; then printf 'HOST='; head -n 1 -- "$task/hostname"; 
             script.push_str(&format!("printf '{field}='; if [ -f \"$task/{file}\" ]; then tail -c {limit} -- \"$task/{file}\" | base64 | tr -d '\\n'; fi; printf '\\n'\nprintf '{field}_SIZE='; if [ -f \"$task/{file}\" ]; then wc -c < \"$task/{file}\"; else printf '0\\n'; fi\n"));
         }
     }
-    let record = execute(executor, workspace, node, &script).await?;
+    let record = execute(executor, workspace, node, &script, true).await?;
     if record.exit_code != Some(0) {
         return Err(CoreError::Connection(
             "Task monitoring failed; task outcome remains unknown".into(),
@@ -241,7 +287,7 @@ if [ -f "$task/hostname" ]; then printf 'HOST='; head -n 1 -- "$task/hostname"; 
         .collect::<std::collections::HashMap<_, _>>();
     let code = fields.get("CODE").and_then(|v| v.parse::<i32>().ok());
     task["status"] = json!(match fields.get("STATE").copied() {
-        Some("finished") =>
+        Some("finished") if code.is_some_and(|code|(0..=255).contains(&code)) =>
             if code == Some(0) {
                 "succeeded"
             } else {
@@ -264,12 +310,16 @@ if [ -f "$task/hostname" ]; then printf 'HOST='; head -n 1 -- "$task/hostname"; 
     task["exit_code"] = json!(code);
     task["hostname"] = json!(fields.get("HOST"));
     task["last_checked_at"] = json!(chrono::Utc::now());
-    if let Err(error) = workspace_store::save_job_record(config, workspace.id, &key(id), &task) {
-        task["warning"] = json!(format!(
-            "Live state retrieved, but local state update failed: {error}"
-        ));
+    task["observation_started_at"]=json!(observed_at);
+    match commit_observation(config,workspace,id,task.clone(),executor.timeout()).await {
+        Ok(latest)=>task=latest,
+        Err(error)=>task["warning"]=json!(format!("Live state retrieved, but local state update failed: {error}")),
     }
     if let Some(limit) = log_bytes {
+        if task["observation_started_at"]!=json!(observed_at) {
+            task["warning"]=json!("Retained a confirmed task state from another observation; request logs again if final output is needed");
+        }
+        task["logs_observation_started_at"]=json!(observed_at);
         for (field, name) in [("OUT", "stdout"), ("ERR", "stderr")] {
             let bytes = crate::b64::decode(fields.get(field).copied().unwrap_or(""))
                 .map_err(CoreError::Validation)?;
@@ -281,4 +331,42 @@ if [ -f "$task/hostname" ]; then printf 'HOST='; head -n 1 -- "$task/hostname"; 
         }
     }
     Ok(task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn observation(status:&str,code:Value,seconds:i64)->Value {
+        json!({"kind":"ssh-task","task_id":"fixture","workspace_id":"fixture","remote_host":"fixture.invalid",
+            "remote_user":"fixture","remote_port":22,"work_root":"/work","compute_node":null,"status":status,"exit_code":code,
+            "observation_started_at":chrono::DateTime::from_timestamp(seconds,0).unwrap()})
+    }
+    #[test]
+    fn valid_terminal_evidence_survives_older_and_newer_nonterminal_updates() {
+        for (state,code) in [("succeeded",0),("failed",9)] {
+            let terminal=observation(state,json!(code),20);
+            for time in [10,30] {
+                assert_eq!(merge_observation(Some(terminal.clone()),observation("starting",Value::Null,time)).unwrap(),terminal);
+            }
+            assert_eq!(merge_observation(Some(observation("running",Value::Null,30)),terminal.clone()).unwrap(),terminal);
+            let refreshed=observation(state,json!(code),30);
+            assert_eq!(merge_observation(Some(terminal.clone()),refreshed.clone()).unwrap(),refreshed);
+            assert_eq!(merge_observation(Some(refreshed.clone()),terminal).unwrap(),refreshed);
+        }
+    }
+    #[test]
+    fn observation_order_prevents_late_start_callbacks_from_regressing_live_state() {
+        let latest=observation("running",Value::Null,20);
+        assert_eq!(merge_observation(Some(latest.clone()),observation("started",Value::Null,10)).unwrap(),latest);
+        let mut different=latest.clone();different["remote_host"]=json!("other.invalid");
+        assert!(merge_observation(Some(latest),different).is_err());
+    }
+    #[test]
+    fn invalid_exit_evidence_cannot_freeze_a_terminal_state() {
+        let invalid=observation("failed",Value::Null,30);
+        assert!(!terminal(&invalid));
+        let success=observation("succeeded",json!(0),20);
+        assert_eq!(merge_observation(Some(invalid),success.clone()).unwrap(),success);
+        assert!(!terminal(&observation("failed",json!(9999),20)));
+    }
 }

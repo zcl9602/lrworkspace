@@ -230,6 +230,36 @@ pub fn save_job_record(config:&LrWorkspaceConfig, workspace:WorkspaceId, job_id:
     write_json_atomic(&job_record_path(config,workspace,job_id)?,record)
 }
 
+/// A bounded cross-process read/modify/write. The sidecar is never unlinked:
+/// replacing it could let two processes lock different inodes for one record.
+/// Async callers must run this filesystem operation on a blocking worker.
+pub fn update_job_record<F>(config:&LrWorkspaceConfig, workspace:WorkspaceId, job_id:&str,
+    timeout:std::time::Duration, update:F) -> CoreResult<serde_json::Value>
+where F:FnOnce(Option<serde_json::Value>)->CoreResult<serde_json::Value> {
+    let path=job_record_path(config,workspace,job_id)?;
+    std::fs::create_dir_all(path.parent().expect("job record parent"))?;
+    let mut options=std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    let lock=options.open(path.with_extension("lock"))?;
+    let started=std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(())=>break,
+            Err(std::fs::TryLockError::WouldBlock) if started.elapsed()<timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock)=>return Err(CoreError::Timeout("Task state update lock deadline exceeded".into())),
+            Err(std::fs::TryLockError::Error(error))=>return Err(error.into()),
+        }
+    }
+    let current=load_job_record(config,workspace,job_id)?;
+    let next=update(current)?;
+    write_json_atomic(&path,&next)?;
+    // Dropping the file releases the OS lock on Windows, macOS and Linux.
+    Ok(next)
+}
+
 pub fn load_job_record(config:&LrWorkspaceConfig, workspace:WorkspaceId, job_id:&str) -> CoreResult<Option<serde_json::Value>> {
     match std::fs::read_to_string(job_record_path(config,workspace,job_id)?) {
         Ok(payload)=>Ok(Some(serde_json::from_str(&payload)?)),
@@ -241,6 +271,27 @@ pub fn load_job_record(config:&LrWorkspaceConfig, workspace:WorkspaceId, job_id:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn job_record_updates_serialize_and_a_held_lock_has_a_deadline() {
+        let root=std::env::temp_dir().join(format!("lrw-job-lock-{}",Uuid::new_v4()));
+        let config=LrWorkspaceConfig{data_dir:root.clone(),..Default::default()};let id=Uuid::new_v4();
+        let mut workers=Vec::new();
+        for _ in 0..4 {
+            let config=config.clone();
+            workers.push(std::thread::spawn(move||for _ in 0..8 {
+                update_job_record(&config,id,"fixture",std::time::Duration::from_secs(5),|old|
+                    Ok(serde_json::json!({"counter":old.as_ref().and_then(|v|v["counter"].as_u64()).unwrap_or(0)+1}))).unwrap();
+            }));
+        }
+        for worker in workers {worker.join().unwrap();}
+        assert_eq!(load_job_record(&config,id,"fixture").unwrap().unwrap()["counter"],32);
+        let path=job_record_path(&config,id,"fixture").unwrap().with_extension("lock");
+        let guard=std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();guard.lock().unwrap();
+        assert!(matches!(update_job_record(&config,id,"fixture",std::time::Duration::from_millis(10),|_|Ok(serde_json::json!({"counter":0}))),Err(CoreError::Timeout(_))));
+        drop(guard);
+        assert_eq!(load_job_record(&config,id,"fixture").unwrap().unwrap()["counter"],32);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn legacy_key_passphrases_are_memory_only_and_never_replicated_into_backups() {

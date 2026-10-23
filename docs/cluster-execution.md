@@ -6,7 +6,7 @@
 |---|---|
 | `run --force cluster` | 重新发现 Slurm/PBS 空闲节点，探测第二跳 SSH，选择可达节点运行；没有合适节点时提交调度器 |
 | `run --force cluster --execution-path submit` | 登录节点提交 Slurm/PBS，任务在分配的计算节点运行 |
-| `run --force cluster --compute-node compute01` | 经登录节点 SSH 到指定计算节点，不自动重提 |
+| `run --force cluster --compute-node compute01` | 验证指定节点属于本次清单后，经登录节点 SSH 运行，不自动重提 |
 | `run --force direct` | 已确认的单服务器执行 |
 
 自动选择依据本次调度器发现结果，只选择 `idle/free` 节点，遵守已保存的允许队列限制，排除未知、占用、离线和登录端点。多个请求分散选择候选节点；最多探测四个节点。探测只核对主机与工作目录，不运行用户 workload。第二跳在执行前对比实际主机名，别名回到登录节点也会拒绝。
@@ -44,3 +44,5 @@ CLI 默认保持前台输出，`--background` 启用后台任务；MCP 可设 `b
 启动前先落盘句柄。发送 workload 后发生连接异常时返回可查询的 `task_id` 和 unknown 状态，不重新启动、不切换节点重跑、不回落登录节点。只有尚未发送 workload 的自动探测失败，才可换候选节点或选择调度提交。
 
 节点配置继续使用 CLI `--node-mode submit-only` / MCP `submit_only` 表示集群登录端点；这是保留的存储名称，不代表任务必须仅用调度器。单服务器使用 `single-server` / `single_server`，兼容旧 `direct-compute` / `direct_compute`。
+
+0.6.3 起，显式节点不能跳过新鲜节点清单与允许分区校验；目标实际主机名不匹配时拒绝执行。节点清单缺失或名字不明确时使用 submit，不把其它可 SSH 主机当成计算节点。既有任务只读监控继续沿用原节点记录。

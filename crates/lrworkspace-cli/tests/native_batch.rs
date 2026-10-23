@@ -45,6 +45,7 @@ impl Fixture {
         if let Some(path)=std::env::var_os("PATH"){paths.extend(std::env::split_paths(&path));}
         command.env("PATH",std::env::join_paths(paths).unwrap())
             .env("LRW_TEST_TRANSFER_LOG",self.root.join("transfers.log"))
+            .env("LRW_TEST_POLL_ROOT",&self.root)
             .env("LRWORKSPACE_SSH",self.root.join("bin").join(if cfg!(windows){"ssh.exe"}else{"ssh"})).env("LRWORKSPACE_SCP",self.root.join("bin").join(if cfg!(windows){"scp.exe"}else{"scp"}))
             .env("LRWORKSPACE_CONFIG",self.root.join("config.toml")).env("LRWORKSPACE_DATA_DIR",&self.config.data_dir)
             .env("LRWORKSPACE_RSYNC",self.root.join("bin").join(if cfg!(windows){"rsync.exe"}else{"rsync"}))
@@ -148,7 +149,7 @@ fn cluster_ssh_uses_login_hop_and_preserves_quotes_workdir_and_exit_status() {
     let result:serde_json::Value=serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["mode"],"cluster");assert_eq!(result["execution_path"],"ssh");assert_eq!(result["compute_node"],"compute01");
     let stdout=result["result"]["stdout"].as_str().unwrap();
-    assert!(stdout.contains("quoted 'value' and spaces"),"{stdout}");assert!(stdout.contains("/space dir"));assert!(stdout.contains("compute-fixture"));
+    assert!(stdout.contains("quoted 'value' and spaces"),"{stdout}");assert!(stdout.contains("/space dir"));assert!(stdout.contains("compute01"));
     assert!(!f.root.join("submissions.log").exists());
     let log=std::fs::read_to_string(f.root.join("compute-ssh.log")).unwrap();
     assert!(log.contains("compute01") && log.contains("BatchMode=yes") && log.contains("ForwardAgent=no"));
@@ -194,7 +195,7 @@ fn mcp_cluster_ssh_uses_the_same_explicit_node_route() {
     let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect(); responses.sort_by_key(|v|v["id"].as_u64());
     let result:serde_json::Value=serde_json::from_str(responses[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(result["execution_path"],"ssh");assert_eq!(result["result"]["exit_code"],9);
-    assert!(result["result"]["stdout"].as_str().unwrap().contains("compute-fixture"));
+    assert!(result["result"]["stdout"].as_str().unwrap().contains("compute01"));
     assert!(responses[2].get("error").is_some() || responses[2]["result"]["isError"]==true,"{}",responses[2]);
     assert!(!f.root.join("submissions.log").exists());assert!(!f.root.join("work/should-not-run").exists());
 }
@@ -295,7 +296,9 @@ impl McpClient {
     fn call(&mut self,id:u64,name:&str,arguments:serde_json::Value) {
         self.send(serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}));
     }
+    #[track_caller]
     fn reply(&self)->serde_json::Value {self.output.recv_timeout(std::time::Duration::from_secs(15)).expect("MCP response blocked behind another request")}
+    #[track_caller]
     fn result(&self)->serde_json::Value {
         let response=self.reply();assert!(response.get("error").is_none(),"{response}");
         serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
@@ -338,7 +341,7 @@ fn cluster_automatically_selects_idle_compute_nodes_and_can_explicitly_submit() 
     let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
     let result=success(f.command().env("LRW_TEST_IDLE_COMPUTE","1").args(["run","--workspace","fixture","--","hostname -s"]).output().unwrap());
     assert_eq!(result["execution_path"],"ssh");assert_eq!(result["compute_node"],"compute01");
-    assert!(result["result"]["stdout"].as_str().unwrap().contains("compute-fixture"));
+    assert!(result["result"]["stdout"].as_str().unwrap().contains("compute01"));
     let result=success(f.command().env("LRW_TEST_IDLE_COMPUTE","1").args(["run","--workspace","fixture","--execution-path","submit","--","touch should-not-run-on-login"]).output().unwrap());
     assert_eq!(result["execution_path"],"submit");assert_eq!(result["job_id"],"4242");
     let rejected=f.command().env("LRW_TEST_IDLE_COMPUTE","1").env("LRW_TEST_SAME_HOST","1")
@@ -395,7 +398,7 @@ fn mcp_concurrent_background_tasks_have_live_logs_and_survive_restart() {
         assert!(std::time::Instant::now()<ready,"{value}");
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    assert_eq!(logs["hostname"],"compute-fixture");assert!(logs["stdout"].as_str().unwrap().contains("-start"));
+    assert_eq!(logs["hostname"],"compute01");assert!(logs["stdout"].as_str().unwrap().contains("-start"));
     assert!(logs["stderr"].as_str().unwrap().contains("-stderr"));
     drop(client);
     let mut client=McpClient::new(&f,true);
@@ -486,4 +489,52 @@ fn mcp_file_images_and_downloads_use_binary_transport() {
     let metadata:serde_json::Value=serde_json::from_str(preview[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(metadata["transport"],"rsync"); assert!(metadata.get("content").is_none());
     assert_eq!(std::fs::read(destination).unwrap(),bytes);
+}
+
+#[test]
+fn explicit_cluster_targets_are_verified_before_any_workload_is_sent() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let rejected=f.command().args(["run","--workspace","fixture","--compute-node","login02","--","touch should-not-run"]).output().unwrap();
+    assert!(!rejected.status.success());assert!(!f.root.join("work/should-not-run").exists());
+    assert!(!f.root.join("compute-ssh.log").exists());
+    let rejected=f.command().env("LRW_TEST_TARGET_HOST","other-login").args(["run","--workspace","fixture","--compute-node","compute01","--","touch should-not-run"]).output().unwrap();
+    assert!(!rejected.status.success());assert!(!f.root.join("work/should-not-run").exists());
+    let absent=f.command().env("LRW_TEST_NO_COMPUTE","1").args(["run","--workspace","fixture","--compute-node","compute01","--","touch should-not-run"]).output().unwrap();
+    assert!(!absent.status.success());assert!(!f.root.join("work/should-not-run").exists());
+}
+
+#[test]
+#[ignore="requires matching MCP binary; two isolated local clients and a deterministic poll gate"]
+fn mcp_concurrent_status_never_regresses_across_processes() {
+    let Some(mut f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    f.workspace.node_execution_mode=NodeExecutionMode::DirectCompute;
+    workspace_store::save_workspace(&f.config,&f.workspace).unwrap();
+    std::fs::copy(f.root.join("helper.exe"),f.root.join("bin").join(if cfg!(windows){"head.exe"}else{"head"})).unwrap();
+    let id=uuid::Uuid::new_v4();let directory=f.root.join("work/._lrworkspace_tasks").join(id.to_string());
+    std::fs::create_dir_all(&directory).unwrap();std::fs::write(directory.join("hostname"),b"poll-fixture\n").unwrap();
+    let key=format!("exec-{id}");
+    workspace_store::save_job_record(&f.config,f.workspace.id,&key,&serde_json::json!({
+        "kind":"ssh-task","task_id":id,"workspace_id":f.workspace.id,"compute_node":null,
+        "remote_host":f.workspace.connection.host,"remote_user":f.workspace.connection.user,
+        "remote_port":f.workspace.connection.port,"work_root":f.workspace.remote_work_dir,
+        "created_at":chrono::Utc::now(),"status":"started"
+    })).unwrap();
+    let mut first=McpClient::new(&f,false);let mut second=McpClient::new(&f,false);
+    first.call(2,"workspace_task_status",serde_json::json!({"workspace_id":"fixture","task_id":id}));
+    let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+    while !f.root.join("first-poll-head").exists() {assert!(std::time::Instant::now()<deadline,"first poll did not reach gate");std::thread::sleep(std::time::Duration::from_millis(5));}
+    std::fs::write(directory.join("exit_code"),b"0\n").unwrap();
+    second.call(2,"workspace_task_status",serde_json::json!({"workspace_id":"fixture","task_id":id}));
+    assert_eq!(second.result()["status"],"succeeded");
+    std::fs::write(f.root.join("release-poll-head"),b"go").unwrap();
+    let older=first.result();assert_eq!(older["status"],"succeeded");assert_eq!(older["exit_code"],0);
+    assert_eq!(workspace_store::load_job_record(&f.config,f.workspace.id,&key).unwrap().unwrap()["status"],"succeeded");
+    // Read-only monitoring keeps old IP/alias task handles usable after the upgrade.
+    let legacy_id=uuid::Uuid::new_v4();let legacy_dir=f.root.join("work/._lrworkspace_tasks").join(legacy_id.to_string());
+    std::fs::create_dir_all(&legacy_dir).unwrap();std::fs::write(legacy_dir.join("hostname"),b"poll-fixture\n").unwrap();std::fs::write(legacy_dir.join("exit_code"),b"0\n").unwrap();
+    let mut legacy=workspace_store::load_job_record(&f.config,f.workspace.id,&key).unwrap().unwrap();
+    legacy["task_id"]=serde_json::json!(legacy_id);legacy["compute_node"]=serde_json::json!("10.0.0.8");legacy["status"]=serde_json::json!("started");legacy["exit_code"]=serde_json::Value::Null;
+    workspace_store::save_job_record(&f.config,f.workspace.id,&format!("exec-{legacy_id}"),&legacy).unwrap();
+    second.call(3,"workspace_task_status",serde_json::json!({"workspace_id":"fixture","task_id":legacy_id}));
+    assert_eq!(second.result()["status"],"succeeded");
 }

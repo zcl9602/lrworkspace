@@ -4,6 +4,18 @@ fn main() {
     let program=std::env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().to_ascii_lowercase();
     let args:Vec<_>=std::env::args().skip(1).collect();
     match program.as_str() {
+        "head"=>{
+            let root=std::path::PathBuf::from(std::env::var_os("LRW_TEST_POLL_ROOT").expect("poll fixture root"));
+            let first=std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("first-poll-head")).is_ok();
+            if first {
+                let deadline=std::time::Instant::now()+std::time::Duration::from_secs(10);
+                while !root.join("release-poll-head").exists() {
+                    if std::time::Instant::now()>deadline {eprintln!("poll fixture gate timed out");std::process::exit(1);}
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            println!("poll-fixture");
+        }
         "setsid"=>{
             #[cfg(unix)] {
                 use std::os::unix::process::CommandExt;
@@ -26,7 +38,8 @@ fn main() {
         }
         "hostname"=>{
             let compute=std::env::var_os("LRW_TEST_ON_COMPUTE").is_some() && std::env::var_os("LRW_TEST_SAME_HOST").is_none();
-            println!("{}",if compute {"compute-fixture"} else {"login-fixture"});
+            let host=if compute {std::env::var("LRW_TEST_TARGET_HOST").unwrap_or_else(|_|"compute01".into())} else {"login-fixture".into()};
+            println!("{host}");
         }
         "ssh"=>{
             if std::env::var_os("LRW_TEST_BLOCK_STDIN").is_some(){std::thread::sleep(std::time::Duration::from_secs(4));return;}
@@ -45,9 +58,10 @@ fn main() {
             let status=command.status().unwrap();std::process::exit(status.code().unwrap_or(1));
         }
         "sinfo"=> {
-            if std::env::var_os("LRW_TEST_IDLE_COMPUTE").is_some() {
+            if std::env::var_os("LRW_TEST_NO_COMPUTE").is_none() {
                 if args.iter().any(|arg|arg.contains("%n")) {
-                    if args.iter().any(|arg|arg=="-N"||arg=="--Node") {println!("compute01 32 128000 (null) idle default");}
+                    let state=if std::env::var_os("LRW_TEST_IDLE_COMPUTE").is_some(){"idle"}else{"alloc"};
+                    if args.iter().any(|arg|arg=="-N"||arg=="--Node") {println!("compute01 32 128000 (null) {state} default");}
                     else {println!("compute[01-02] 32 128000 (null) idle default");}
                 }
                 else {println!("default* 1 1-00:00:00 1:00:00 compute01");}
