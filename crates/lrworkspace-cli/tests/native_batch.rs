@@ -14,7 +14,7 @@ impl Fixture {
         let source=Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake_scheduler.rs");
         let compiled=Command::new("rustc").arg(source).arg("-o").arg(&executable).output().unwrap();
         assert!(compiled.status.success(),"{}",String::from_utf8_lossy(&compiled.stderr));
-        for program in ["ssh","scp","rsync","sbatch","qsub","qstat","hostname","sinfo"] {
+        for program in ["ssh","scp","rsync","sbatch","qsub","qstat","hostname","sinfo","getent","awk"] {
             let name=if cfg!(windows){format!("{program}.exe")}else{program.into()};
             std::fs::copy(&executable,root.join("bin").join(name)).unwrap();
         }
@@ -47,6 +47,8 @@ impl Fixture {
             .env("LRW_TEST_TRANSFER_LOG",self.root.join("transfers.log"))
             .env("LRW_TEST_POLL_ROOT",&self.root)
             .env("LRW_TEST_PBS_PROBE_LOG",self.root.join("pbs-probes.log")).env_remove("LRW_TEST_PBS_VERSION")
+            .env_remove("LRW_TEST_CANONICAL_HOST").env_remove("LRW_TEST_SERVER_IP").env_remove("LRW_TEST_TARGET_HOST")
+            .env_remove("LRW_TEST_ON_LOGIN").env_remove("LRW_TEST_FREE_CPUS").env_remove("LRW_TEST_FREE_MEMORY_PERCENT").env_remove("LRW_TEST_UNKNOWN_RESOURCES")
             .env("LRWORKSPACE_SSH",self.root.join("bin").join(if cfg!(windows){"ssh.exe"}else{"ssh"})).env("LRWORKSPACE_SCP",self.root.join("bin").join(if cfg!(windows){"scp.exe"}else{"scp"}))
             .env("LRWORKSPACE_CONFIG",self.root.join("config.toml")).env("LRWORKSPACE_DATA_DIR",&self.config.data_dir)
             .env("LRWORKSPACE_RSYNC",self.root.join("bin").join(if cfg!(windows){"rsync.exe"}else{"rsync"}))
@@ -54,6 +56,8 @@ impl Fixture {
             .env("LRW_TEST_BASH",&self.bash).env("LRW_TEST_SUBMIT_LOG",self.root.join("submissions.log"))
             .env_remove("LRWORKSPACE_FILE_THRESHOLD_MB").env_remove("LRWORKSPACE_SSH_TIMEOUT")
             .current_dir(&self.root);
+        #[cfg(windows)] command.env("LRW_TEST_REAL_AWK",r"C:\Program Files\Git\usr\bin\awk.exe");
+        #[cfg(unix)] command.env("LRW_TEST_REAL_AWK","/usr/bin/awk");
         command
     }
 }
@@ -302,12 +306,17 @@ struct McpClient {
     child: std::process::Child,
     input: Option<std::process::ChildStdin>,
     output: std::sync::mpsc::Receiver<serde_json::Value>,
+    reply_timeout:std::time::Duration,
 }
 impl McpClient {
     fn new(f:&Fixture, automatic_nodes:bool)->Self {
         Self::with_pbs_version(f,automatic_nodes,None)
     }
     fn with_pbs_version(f:&Fixture, automatic_nodes:bool,pbs_version:Option<&str>)->Self {
+        let extra=pbs_version.map(|version|vec![("LRW_TEST_PBS_VERSION",version)]).unwrap_or_default();
+        Self::with_env(f,automatic_nodes,&extra)
+    }
+    fn with_env(f:&Fixture,automatic_nodes:bool,extra:&[(&str,&str)])->Self {
         use std::io::BufRead;
         use std::process::Stdio;
         let binary=Path::new(env!("CARGO_BIN_EXE_rw")).parent().unwrap()
@@ -315,7 +324,7 @@ impl McpClient {
         assert!(binary.is_file(),"Build the matching MCP binary first");
         let mut command=f.command_for(&binary);
         if automatic_nodes {command.env("LRW_TEST_IDLE_COMPUTE","1");}
-        if let Some(version)=pbs_version {command.env("LRW_TEST_PBS_VERSION",version);}
+        for (name,value) in extra {command.env(name,value);}
         let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
         let input=child.stdin.take();let stdout=child.stdout.take().unwrap();
         let (sender,output)=std::sync::mpsc::channel();
@@ -326,7 +335,7 @@ impl McpClient {
                 if sender.send(value).is_err(){break;}
             }
         });
-        let mut client=Self{child,input,output};
+        let mut client=Self{child,input,output,reply_timeout:std::time::Duration::from_secs(15)};
         client.send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"concurrency-test"}}}));
         assert_eq!(client.reply()["id"],1);client
     }
@@ -338,7 +347,7 @@ impl McpClient {
         self.send(serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}}));
     }
     #[track_caller]
-    fn reply(&self)->serde_json::Value {self.output.recv_timeout(std::time::Duration::from_secs(15)).expect("MCP response blocked behind another request")}
+    fn reply(&self)->serde_json::Value {self.output.recv_timeout(self.reply_timeout).expect("MCP response blocked behind another request")}
     #[track_caller]
     fn result(&self)->serde_json::Value {
         let response=self.reply();assert!(response.get("error").is_none(),"{response}");
@@ -391,12 +400,16 @@ fn mcp_path_hints_do_not_require_a_failed_first_call_or_allow_login_workloads() 
 fn mcp_pbs_run_identifies_torque_on_the_first_call_and_reuses_it_after_restart() {
     let Some(f)=Fixture::new(ClusterScheduler::Pbs) else{return};
     let mut client=McpClient::with_pbs_version(&f,false,Some("fallback-torque"));
+    // This request explicitly budgets 30 s for multi-step batch preparation.
+    // Keep a margin when other fixtures compile their synthetic SSH binaries.
+    client.reply_timeout=std::time::Duration::from_secs(45);
     client.call(2,"workspace_run",serde_json::json!({"workspace_id":"fixture","execution_path":"submit",
         "command":"printf first-command","timeout_sec":30}));
     let first=client.result();assert_eq!(first["batch"]["pbs_flavor"],"torque");assert_eq!(first["status"],"submitted");
     drop(client);
     let probes=std::fs::read_to_string(f.root.join("pbs-probes.log")).unwrap();
     let mut client=McpClient::with_pbs_version(&f,false,Some("unknown"));
+    client.reply_timeout=std::time::Duration::from_secs(45);
     client.call(2,"workspace_submit",serde_json::json!({"workspace_id":"fixture","commands_text":"printf second-command",
         "submit":true,"timeout_sec":30}));
     assert_eq!(client.result()["batch"]["pbs_flavor"],"torque");
@@ -597,6 +610,95 @@ fn explicit_cluster_targets_are_verified_before_any_workload_is_sent() {
     assert!(!rejected.status.success());assert!(!f.root.join("work/should-not-run").exists());
     let absent=f.command().env("LRW_TEST_NO_COMPUTE","1").args(["run","--workspace","fixture","--compute-node","compute01","--","touch should-not-run"]).output().unwrap();
     assert!(!absent.status.success());assert!(!f.root.join("work/should-not-run").exists());
+}
+
+#[test]
+fn compute_dns_aliases_require_a_matching_hostname_and_the_real_ssh_peer() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let accepted=success(f.command().env("LRW_TEST_CANONICAL_HOST","Worker01.example.invalid")
+        .env("LRW_TEST_TARGET_HOST","worker01").args(["run","--workspace","fixture","--compute-node","compute01","--","hostname -s"]).output().unwrap());
+    assert_eq!(accepted["result"]["stdout"],"worker01\n");
+    for (canonical,actual,peer) in [("worker01.example.invalid","worker01","192.0.2.12"),
+        ("worker01.example.invalid","another-worker","192.0.2.11"),
+        ("worker01;invalid","worker01","192.0.2.11"),
+        ("login-fixture","login-fixture","192.0.2.11")] {
+        let rejected=f.command().env("LRW_TEST_CANONICAL_HOST",canonical).env("LRW_TEST_TARGET_HOST",actual)
+            .env("LRW_TEST_SERVER_IP",peer).args(["run","--workspace","fixture","--compute-node","compute01","--","touch should-not-run"]).output().unwrap();
+        assert!(!rejected.status.success(),"unexpectedly accepted {canonical} {actual} {peer}");
+        assert!(!f.root.join("work/should-not-run").exists());
+    }
+    assert!(!f.root.join("submissions.log").exists());
+}
+
+#[test]
+fn automatic_compute_failures_report_identity_evidence_before_scheduler_fallback() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let strict=f.command().env("LRW_TEST_IDLE_COMPUTE","1").env("LRW_TEST_TARGET_HOST","unexpected-worker")
+        .args(["run","--workspace","fixture","--execution-path","ssh","--","touch should-not-run"]).output().unwrap();
+    assert!(!strict.status.success());let error=String::from_utf8_lossy(&strict.stderr);
+    assert!(error.contains("1 compute candidates") && error.contains("actual=unexpected-worker"),"{error}");
+    assert!(!f.root.join("submissions.log").exists());
+    let submitted=success(f.command().env("LRW_TEST_IDLE_COMPUTE","1").env("LRW_TEST_TARGET_HOST","unexpected-worker")
+        .args(["run","--workspace","fixture","--","touch should-not-run"]).output().unwrap());
+    assert_eq!(submitted["execution_path"],"submit");assert_eq!(submitted["compute_selection"]["candidate_nodes"],1);
+    assert!(submitted["compute_selection"]["probe_failures"][0].as_str().unwrap().contains("actual=unexpected-worker"));
+    assert!(!f.root.join("work/should-not-run").exists());
+}
+
+#[test]
+#[ignore="requires matching MCP binary; synthetic DNS aliases and SSH peer metadata only"]
+fn mcp_compute_dns_aliases_work_without_scheduler_submission_and_report_the_running_version() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let mut client=McpClient::with_env(&f,true,&[("LRW_TEST_CANONICAL_HOST","worker01.example.invalid"),("LRW_TEST_TARGET_HOST","worker01")]);
+    client.call(2,"workspace_discover",serde_json::json!({}));
+    assert_eq!(client.result()["server_version"],env!("CARGO_PKG_VERSION"));
+    for explicit in [false,true] {
+        let mut args=serde_json::json!({"workspace_id":"fixture","execution_path":"ssh","background":false,"command":"hostname -s"});
+        if explicit {args["compute_node"]=serde_json::json!("compute01");}
+        client.call(3,"workspace_run",args);
+        let value=client.result();assert_eq!(value["result"]["stdout"],"worker01\n");assert_eq!(value["compute_node"],"compute01");
+    }
+    assert!(!f.root.join("submissions.log").exists());
+}
+
+#[test]
+fn allocated_nodes_can_be_used_when_actual_cpu_and_memory_meet_the_thresholds() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    // The fake scheduler reports alloc, while measured host availability is high.
+    let result=success(f.command().args(["run","--workspace","fixture","--execution-path","ssh","--","hostname -s"]).output().unwrap());
+    assert_eq!(result["execution_path"],"ssh");assert_eq!(result["result"]["stdout"],"compute01\n");
+    assert_eq!(result["connection_chain"],serde_json::json!([f.workspace.connection.host,"compute01"]));
+    assert!(result["compute_selection"]["selected_resources"]["available_cpu_cores"].as_f64().unwrap()>=3.0);
+    assert!(result["compute_selection"]["selected_resources"]["available_memory_percent"].as_f64().unwrap()>20.0);
+    assert!(!f.root.join("submissions.log").exists());
+    for (cpus,memory) in [("2","80"),("6","20")] {
+        let denied=f.command().env("LRW_TEST_FREE_CPUS",cpus).env("LRW_TEST_FREE_MEMORY_PERCENT",memory)
+            .args(["run","--workspace","fixture","--compute-node","compute01","--","touch should-not-run"]).output().unwrap();
+        assert!(!denied.status.success());assert!(!f.root.join("work/should-not-run").exists());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("requires CPU >= 3 and RAM > 20%"));
+    }
+    let unknown=f.command().env("LRW_TEST_UNKNOWN_RESOURCES","1")
+        .args(["run","--workspace","fixture","--execution-path","ssh","--","touch should-not-run"]).output().unwrap();
+    assert!(!unknown.status.success());assert!(!f.root.join("work/should-not-run").exists());
+    assert!(!f.root.join("submissions.log").exists());
+}
+
+#[test]
+#[ignore="requires matching MCP binary; actual-resource policy and enforced login hop use local fixtures"]
+fn mcp_compute_resources_admit_allocated_nodes_and_reject_measured_shortages() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let mut client=McpClient::new(&f,false);
+    client.call(2,"workspace_run",serde_json::json!({"workspace_id":"fixture","execution_path":"ssh","background":false,"command":"hostname -s"}));
+    let value=client.result();
+    assert_eq!(value["connection_chain"],serde_json::json!([f.workspace.connection.host,"compute01"]));
+    assert!(value["compute_selection"]["selected_resources"]["available_cpu_cores"].as_f64().unwrap()>=3.0);
+    assert!(value["compute_selection"]["selected_resources"]["available_memory_percent"].as_f64().unwrap()>20.0);
+    drop(client);
+    let mut client=McpClient::with_env(&f,false,&[("LRW_TEST_FREE_CPUS","2")]);
+    client.call(3,"workspace_run",serde_json::json!({"workspace_id":"fixture","execution_path":"ssh","background":false,"command":"touch should-not-run"}));
+    let denied=client.reply();assert!(denied.get("error").is_some(),"{denied}");
+    assert!(denied["error"]["message"].as_str().unwrap().contains("requires CPU >= 3 and RAM > 20%"));
+    assert!(!f.root.join("work/should-not-run").exists());assert!(!f.root.join("submissions.log").exists());
 }
 
 #[test]

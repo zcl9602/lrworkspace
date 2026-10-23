@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use lrworkspace_core::{CoreError, CoreResult, safety::{normalize_remote_absolute, shell_quote}, types::*};
 use crate::{ExecutionRoute, RemoteExecutorImpl};
 use lrworkspace_core::{config::LrWorkspaceConfig, traits::ClusterDetector, workspace_store};
+use crate::compute_resources::{ResourceSnapshot,RESOURCE_PROBE};
 
 async fn fresh_inventory(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace) -> CoreResult<ClusterConfig> {
@@ -19,9 +20,23 @@ async fn fresh_inventory(executor: &RemoteExecutorImpl, config: &LrWorkspaceConf
 /// Always return the inventory hostname, never an unverified caller-supplied alias.
 pub async fn verify_compute_node(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace, requested: &str) -> CoreResult<String> {
+    Ok(verify_compute_node_detailed(executor,config,workspace,requested).await?.node.expect("verified target"))
+}
+
+pub async fn verify_compute_node_detailed(executor:&RemoteExecutorImpl,config:&LrWorkspaceConfig,
+    workspace:&Workspace,requested:&str)->CoreResult<ComputeSelection> {
     validate_compute_node(ExecutionRoute::Cluster, Some(requested), false)?;
     let cluster = fresh_inventory(executor, config, workspace).await?;
-    resolve_inventory_node(workspace, &cluster, requested)
+    let node=resolve_inventory_node(workspace,&cluster,requested)?;
+    let resources=inspect_resources(executor,workspace,&node).await?;
+    if !resources.admitted() {return Err(CoreError::PermissionDenied(format!("Compute target {node} lacks the required actual spare resources: {}; workload was not started",resources.summary())));}
+    Ok(ComputeSelection{node:Some(node),inventory_nodes:cluster.nodes.len(),candidate_nodes:1,selected_resources:Some(resources),..Default::default()})
+}
+
+async fn inspect_resources(executor:&RemoteExecutorImpl,workspace:&Workspace,node:&str)->CoreResult<ResourceSnapshot> {
+    let record=executor.execute_compute_ssh(workspace,node,RESOURCE_PROBE,None).await?;
+    if record.exit_code!=Some(0) {return Err(CoreError::Connection(format!("compute resource measurement unavailable (CPU/RAM unknown), exit {:?}: {}",record.exit_code,record.stderr.chars().take(1024).collect::<String>().trim())));}
+    ResourceSnapshot::parse(&record.stdout)
 }
 
 fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, requested: &str) -> CoreResult<String> {
@@ -39,6 +54,7 @@ fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, reques
     }
     let node = candidates.iter().find(|node| partition_allowed(cluster, node))
         .ok_or_else(|| CoreError::PermissionDenied("Compute node is outside the configured allowed partitions".into()))?;
+    if !operational(node) {return Err(CoreError::PermissionDenied("Compute node is offline, drained, reserved or under maintenance".into()));}
     validate_compute_node(ExecutionRoute::Cluster, Some(&node.hostname), false)?;
     if node.hostname.eq_ignore_ascii_case(&workspace.connection.host) {
         return Err(CoreError::PermissionDenied("Compute target is the login endpoint".into()));
@@ -46,24 +62,52 @@ fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, reques
     Ok(node.hostname.clone())
 }
 
-/// Probe fresh scheduler-advertised idle nodes before sending any workload.
+/// Measure fresh scheduler-listed compute candidates before sending any workload.
 /// A failed probe is safe to retry; an attempted workload is never replayed.
 pub async fn choose_compute_node(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace) -> CoreResult<Option<String>> {
+    Ok(choose_compute_node_detailed(executor,config,workspace).await?.node)
+}
+
+#[derive(Debug,Default,serde::Serialize)]
+pub struct ComputeSelection {
+    pub node:Option<String>,
+    pub inventory_nodes:usize,
+    pub candidate_nodes:usize,
+    pub selected_resources:Option<ResourceSnapshot>,
+    pub probe_failures:Vec<String>,
+}
+
+impl ComputeSelection {
+    pub fn summary(&self)->String {
+        format!("fresh inventory: {} nodes, {} compute candidates; probe failures: {}",self.inventory_nodes,
+            self.candidate_nodes,if self.probe_failures.is_empty(){"none".into()}else{self.probe_failures.join("; ")})
+    }
+}
+
+pub async fn choose_compute_node_detailed(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
+    workspace: &Workspace) -> CoreResult<ComputeSelection> {
+    let started=std::time::Instant::now();
     let cluster = fresh_inventory(executor, config, workspace).await?;
     let mut nodes = eligible_compute_nodes(workspace, &cluster);
+    let mut selection=ComputeSelection{inventory_nodes:cluster.nodes.len(),candidate_nodes:nodes.len(),..Default::default()};
     // Spread simultaneous requests over the eligible nodes instead of always choosing the first.
     if !nodes.is_empty() {
         let offset = (uuid::Uuid::new_v4().as_u128() % nodes.len() as u128) as usize;
         nodes.rotate_left(offset);
     }
-    let probe = executor.with_timeout(executor.timeout().min(Duration::from_secs(5)));
-    for node in nodes.into_iter().take(4) {
-        if probe.execute_compute_ssh(workspace, &node, ":", None).await.is_ok_and(|r|r.exit_code==Some(0)) {
-            return Ok(Some(node));
+    for node in nodes.into_iter().take(16) {
+        let Some(budget)=executor.timeout().checked_sub(started.elapsed()).filter(|budget|!budget.is_zero()) else {
+            selection.probe_failures.push("compute discovery operation budget exhausted".into());break;
+        };
+        let probe=executor.with_timeout(budget.min(Duration::from_secs(10)));
+        match inspect_resources(&probe,workspace,&node).await {
+            Ok(resources) if resources.admitted()=>{selection.node=Some(node);selection.selected_resources=Some(resources);return Ok(selection);},
+            Ok(resources)=>selection.probe_failures.push(format!("{node}: {}",resources.summary())),
+            Err(error)=>selection.probe_failures.push(format!("{node}: {}",error.to_string().chars().take(1024).collect::<String>())),
         }
     }
-    Ok(None)
+    Ok(selection)
 }
 
 fn partition_allowed(cluster: &ClusterConfig, node: &NodeInfo) -> bool {
@@ -75,12 +119,17 @@ fn partition_allowed(cluster: &ClusterConfig, node: &NodeInfo) -> bool {
 fn eligible_compute_nodes(workspace: &Workspace, cluster: &ClusterConfig) -> Vec<String> {
     if !matches!(cluster.scheduler, ClusterScheduler::Slurm|ClusterScheduler::Pbs) { return Vec::new(); }
     let mut nodes = cluster.nodes.iter().filter(|node| {
-        node.state == "idle" && node.cpu_cores > 0
+        operational(node)
         && !node.hostname.eq_ignore_ascii_case(&workspace.connection.host)
         && validate_compute_node(ExecutionRoute::Cluster,Some(&node.hostname),false).is_ok()
         && partition_allowed(cluster, node)
     }).map(|node|node.hostname.clone()).collect::<Vec<_>>();
     nodes.sort(); nodes.dedup(); nodes
+}
+
+fn operational(node:&NodeInfo)->bool {
+    !node.state.to_ascii_lowercase().split([',','+','*']).any(|state|
+        ["down","drain","offline","maint","resv","reserved"].iter().any(|denied|state.starts_with(denied)))
 }
 
 /// Validate syntax only. Explicit workload targets additionally need verify_compute_node.
@@ -116,14 +165,44 @@ impl RemoteExecutorImpl {
         let cwd = normalize_remote_absolute(&cwd)?;
         // Resolve the actual node and directory on the compute host, before the workload.
         let expected = node.split('.').next().expect("validated hostname").to_ascii_lowercase();
-        let identity_guard=if verify_identity {format!("[ \"$here\" = {} ] || {{ echo 'LRW: SSH target identity differs from the verified compute node' >&2; exit 24; }}\n",shell_quote(&expected))}else{String::new()};
+        let identity_guard=if verify_identity {format!(r#"if [ "$here" != {expected} ]; then
+    lrw_peer=${{SSH_CONNECTION:-}}
+    lrw_peer=${{lrw_peer% *}}
+    lrw_peer=${{lrw_peer##* }}
+    lrw_alias_ok=false
+    lrw_peer_ok=false
+    case ",$2," in *,"$here",*) lrw_alias_ok=true;; esac
+    case ",$3," in *,"$lrw_peer",*) [ -n "$lrw_peer" ] && lrw_peer_ok=true;; esac
+    if [ "$lrw_alias_ok" != true ] || [ "$lrw_peer_ok" != true ]; then
+        printf 'LRW: SSH target identity differs from the verified compute node: target=%s actual=%s; no matching DNS alias and SSH peer address\n' {node} "$here" >&2
+        exit 24
+    fi
+fi
+"#,expected=shell_quote(&expected),node=shell_quote(node))}else{String::new()};
         let inner = format!("here=$(hostname -s | tr '[:upper:]' '[:lower:]') || exit 24\n[ -n \"$here\" ] && [ \"$here\" != \"$1\" ] || {{ echo 'LRW: refusing workload on login endpoint' >&2; exit 24; }}\n{identity_guard}work=$(realpath -e -- {}) || exit 20\ncwd=$(realpath -e -- {}) || exit 21\ncase \"$cwd/\" in \"${{work%/}}/\"*) ;; *) echo 'LRW: compute working_dir escapes work root' >&2; exit 22;; esac\ncd -- \"$cwd\" || exit 23\n{}",
             shell_quote(&work), shell_quote(&cwd), command);
         // No passwords, interactive shell, agent forwarding or host-key bypass.
         // The login user's own SSH configuration/keys must permit the second hop.
-        let remote = format!("bash -lc {} lrw-compute \"$lrw_login_node\"", shell_quote(&inner));
-        Ok(format!("lrw_login_node=$(hostname -s | tr '[:upper:]' '[:lower:]') || exit 24\ncase \"$lrw_login_node\" in \"\"|*[!a-zA-Z0-9._-]*) exit 24;; esac\nssh -T -n -o BatchMode=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout={} {} {}",
-            timeout_secs.clamp(1,30), shell_quote(node), remote_command_argument(&remote)))
+        // Only the inventory target's forward resolution on the login host can
+        // add aliases. A differing hostname also needs the actual SSH server IP
+        // to match that resolution; an SSH-config redirect alone is insufficient.
+        let lookup=if verify_identity {format!(r#"lrw_dns_records=$(getent ahosts {node} 2>/dev/null)
+lrw_dns_count=0
+while read -r lrw_address lrw_socket lrw_canonical lrw_extra; do
+    lrw_dns_count=$((lrw_dns_count + 1))
+    [ "$lrw_dns_count" -le 128 ] || break
+    case "$lrw_address" in ""|*[!0-9a-fA-F:.]*) continue;; esac
+    lrw_compute_addresses="$lrw_compute_addresses,$lrw_address"
+    case "$lrw_canonical" in ""|*[!a-zA-Z0-9.-]*) continue;; esac
+    lrw_canonical=$(printf '%s' "${{lrw_canonical%%.*}}" | tr '[:upper:]' '[:lower:]')
+    [ -n "$lrw_canonical" ] && lrw_compute_names="$lrw_compute_names,$lrw_canonical"
+done <<LRW_COMPUTE_DNS
+$lrw_dns_records
+LRW_COMPUTE_DNS
+"#,node=shell_quote(node))}else{String::new()};
+        let remote = format!("bash -lc {} lrw-compute \"$lrw_login_node\" \"$lrw_compute_names\" \"$lrw_compute_addresses\"", shell_quote(&inner));
+        Ok(format!("lrw_login_node=$(hostname -s | tr '[:upper:]' '[:lower:]') || exit 24\ncase \"$lrw_login_node\" in \"\"|*[!a-zA-Z0-9._-]*) exit 24;; esac\nlrw_compute_names={}\nlrw_compute_addresses=unresolved\n{lookup}ssh -T -n -o BatchMode=yes -o ForwardAgent=no -o ClearAllForwardings=yes -o ConnectTimeout={} {} {}",
+            shell_quote(&expected),timeout_secs.clamp(1,30), shell_quote(node), remote_command_argument(&remote)))
     }
 
     pub async fn execute_compute_ssh(&self, workspace: &Workspace, node: &str, command: &str, working_dir: Option<&Path>) -> CoreResult<ExecutionRecord> {
@@ -145,23 +224,34 @@ impl RemoteExecutorImpl {
     }
 }
 
-// Expand only the trusted local variable, leaving the inner script literal.
+// Names/addresses are validated above and contain no shell syntax or spaces.
+// Expand only these trusted local variables, leaving the inner script literal.
 fn remote_command_argument(remote: &str) -> String {
-    let suffix = "\"$lrw_login_node\"";
-    format!("{}\"$lrw_login_node\"",shell_quote(remote.strip_suffix(suffix).expect("trusted remote template")))
+    let suffix = "\"$lrw_login_node\" \"$lrw_compute_names\" \"$lrw_compute_addresses\"";
+    format!("{}\"$lrw_login_node $lrw_compute_names $lrw_compute_addresses\"",shell_quote(remote.strip_suffix(suffix).expect("trusted remote template")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn explicit_targets_require_inventory_membership_and_partition_authorization() {
-        let workspace:Workspace=serde_json::from_value(serde_json::json!({
+    fn fixture_workspace()->Workspace {
+        serde_json::from_value(serde_json::json!({
             "id":uuid::Uuid::new_v4(),"name":"fixture","display_name":"fixture",
             "connection":{"host":"login.example.invalid","user":"fixture","port":22,"auth":"agent","jump_hosts":[]},
             "remote_work_dir":"/work","remote_data_dirs":[],"node_execution_mode":"submit_only","authorized":true,
             "created_at":chrono::Utc::now(),"last_accessed_at":chrono::Utc::now(),"file_threshold_bytes":1048576,"config":{}
-        })).unwrap();
+        })).unwrap()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn compute_outer_command_parses_in_the_system_posix_shell() {
+        let script=RemoteExecutorImpl::build_compute_ssh_command(&fixture_workspace(),"compute01",":",None,120).unwrap();
+        let output=std::process::Command::new("/bin/sh").args(["-n","-c",&script]).output().unwrap();
+        assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    }
+    #[test]
+    fn explicit_targets_require_inventory_membership_and_partition_authorization() {
+        let workspace=fixture_workspace();
         let node=NodeInfo{hostname:"compute01.example.invalid".into(),cpu_cores:8,memory_mb:16000,
             gpu_count:0,gpu_model:None,state:"alloc".into(),partitions:vec!["cpu".into()],arch:None};
         for scheduler in [ClusterScheduler::Slurm,ClusterScheduler::Pbs] {

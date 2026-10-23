@@ -94,7 +94,7 @@ struct InitializeResult {
 }
 
 const MCP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const AGENT_INSTRUCTIONS: &str = "workspace_discover first. Cluster auto-picks compute; no login workloads. Files read/download/write; no shell base64. No delete.";
+const AGENT_INSTRUCTIONS: &str = "Discover first. Cluster MUST hop login->compute; NEVER local SSH to compute/login workloads. Files API. No shell base64/delete.";
 
 fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { Some("image/png") }
@@ -842,7 +842,9 @@ impl McpServer {
                     },
                     "recommendation_basis": "Heuristic from discovered topology and optional user constraints; not a scheduler allocation or site-policy limit",
                     "partition_limits": {
-                        "nodes_available": nodes.iter().filter(|node| node.state == "idle").count(),
+                        "nodes_available": null,
+                        "nodes_scheduler_idle": nodes.iter().filter(|node| node.state == "idle").count(),
+                        "availability_source": "not measured here; workspace_run probes actual CPU/RAM through login-to-compute SSH",
                         "nodes_discovered": nodes.len(),
                         "cores_per_node": cores_per_node,
                         "memory_per_node_mb": mem_per_node_mb,
@@ -1133,6 +1135,8 @@ impl McpServer {
             .collect();
         Ok(serde_json::json!({
             "architecture": "remote-first-no-sync",
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "compute_access": {"connection_chain":"local -> registered login -> compute","cpu_basis":"measured host idle CPU equivalents over 200ms", "minimum_free_cpus":lrworkspace_remote::compute_resources::MIN_FREE_CPU_CORES,"minimum_free_memory_percent_exclusive":lrworkspace_remote::compute_resources::MIN_FREE_MEMORY_PERCENT},
             "local_platform": std::env::consts::OS,
             "local_arch": std::env::consts::ARCH,
             "local_data_dir": self.config.data_dir,
@@ -1224,20 +1228,26 @@ impl McpServer {
                 if execution_path=="ssh" && has_batch {
                     return Err(CoreError::Validation("SSH cannot be combined with scheduler batch resources".into()));
                 }
-                let selected=if let Some(node)=compute_node {Some(lrworkspace_remote::compute_ssh::verify_compute_node(&executor,&self.config,workspace,node).await?)}
+                let mut selection=None;
+                let selected=if let Some(node)=compute_node {
+                        let report=lrworkspace_remote::compute_ssh::verify_compute_node_detailed(&executor,&self.config,workspace,node).await?;
+                        let node=report.node.clone();selection=Some(report);node
+                    }
                     else if execution_path!="submit" && !has_batch {
-                        lrworkspace_remote::compute_ssh::choose_compute_node(&executor,&self.config,workspace).await?
+                        let report=lrworkspace_remote::compute_ssh::choose_compute_node_detailed(&executor,&self.config,workspace).await?;
+                        let node=report.node.clone();selection=Some(report);node
                     } else {None};
                 if selected.is_none() && execution_path=="ssh" {
-                    return Err(CoreError::NotFound("No reachable idle compute node; workload was not started".into()));
+                    return Err(CoreError::NotFound(format!("No reachable compute node met the measured CPU/memory thresholds; workload was not started; {}",selection.as_ref().map(|report|report.summary()).unwrap_or_default())));
                 }
                 if let Some(node)=selected {
-                    if args.get("background").and_then(Value::as_bool).unwrap_or(true) {
+                    let mut value=if args.get("background").and_then(Value::as_bool).unwrap_or(true) {
                         lrworkspace_remote::tasks::start(&executor,&self.config,workspace,Some(&node),command,working_dir.as_deref()).await?
                     } else {
                         let record=executor.execute_compute_ssh(workspace,&node,command,working_dir.as_deref()).await?;
-                        serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"result":record})
-                    }
+                        serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"connection_chain":[workspace.connection.host,node],"result":record})
+                    };
+                    if let Some(report)=selection {value["compute_selection"]=serde_json::to_value(report)?;} value
                 } else {
                     let cluster = match workspace_store::load_cluster_config(&self.config, workspace.id) {
                         Ok(cluster) => cluster,
@@ -1249,8 +1259,10 @@ impl McpServer {
                         }
                     };
                     let commands=[BatchCommand {source_line:1,command:command.into()}];
-                    let result=submit_batch(Arc::new(executor),&self.config,workspace,&cluster,&commands,&batch_options(args)?,working_dir.as_deref(),true,agent).await?;
-                    let mut value=serde_json::to_value(result)?;value["mode"]=serde_json::json!("cluster");value["execution_path"]=serde_json::json!("submit");value
+                    let result=submit_batch(Arc::new(executor),&self.config,workspace,&cluster,&commands,&batch_options(args)?,working_dir.as_deref(),true,agent).await
+                        .map_err(|error|match &selection {Some(report)=>CoreError::Connection(format!("{}; scheduler fallback failed: {error}",report.summary())),None=>error})?;
+                    let mut value=serde_json::to_value(result)?;value["mode"]=serde_json::json!("cluster");value["execution_path"]=serde_json::json!("submit");
+                    if let Some(report)=selection {value["compute_selection"]=serde_json::to_value(report)?;} value
                 }
             }
             ExecutionRoute::Direct => {
@@ -1349,7 +1361,7 @@ fn elicitation_for_request(request: &JsonRpcRequest) -> Option<Value> {
                 "requestedSchema": {
                     "type": "object",
                     "properties": {
-                        "node_execution_mode": {"type": "string", "title": "SSH node behavior", "enum": ["submit_only", "single_server", "direct_compute"], "description": "submit_only never runs workloads on the login endpoint; cluster automatically selects idle compute SSH nodes, or submits to the scheduler. single_server permits explicit force=direct on a standalone server; default execution remains cluster; direct_compute is its legacy alias"},
+                        "node_execution_mode": {"type": "string", "title": "SSH node behavior", "enum": ["submit_only", "single_server", "direct_compute"], "description": "submit_only never runs workloads on the login endpoint; cluster measures actual spare CPU/memory through login-to-compute SSH, or submits to the scheduler. single_server permits explicit force=direct on a standalone server; default execution remains cluster; direct_compute is its legacy alias"},
                         "confirmed": {"type": "boolean", "title": "I confirm this node behavior", "default": false}
                     },
                     "required": ["node_execution_mode", "confirmed"]
@@ -1465,12 +1477,12 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         tool("workspace_read_file", "Preview bounded UTF-8 text or PNG/JPEG/GIF/WebP images from work/data roots. Images return native MCP image content. auto tries rsync then SCP; base64 SSH is explicit only. For full/binary files use workspace_download_file, never workspace_run base64. No persistent local copy.", rooted_path, &["relative_path"]),
         tool("workspace_download_file", "Download any file from work/data roots to a NEW absolute local_path in the agent project. Streams through rsync, falls back to SCP; no automatic base64. Never overwrites an existing file. Returns path, size, actual transport and fallback reasons, without file contents. Parent directory must exist. No project registration required.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","default":"work"},"relative_path":{"type":"string"},"local_path":{"type":"string"},"transport":{"type":"string","enum":["auto","rsync","scp"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path","local_path"]),
         tool("workspace_write_file", "Upload a file from the agent's own project via local_path, or supply UTF-8 content. Exactly one input is required. Writes stay under the remote work root; no local project registration. transport=rsync/scp/base64 is strict; auto tries rsync then SCP without base64 fallback. Returns the actual transport.", serde_json::json!({"workspace_id":{"type":"string"},"root":{"type":"string","enum":["work"],"default":"work"},"relative_path":{"type":"string"},"content":{"type":"string"},"local_path":{"type":"string","description":"Existing file in the agent's own local project"},"transport":{"type":"string","enum":["auto","rsync","scp","base64"],"default":"auto"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["relative_path"]),
-        tool("workspace_run", "For file/image transfer use workspace_read_file/download_file/write_file; do not run base64 to move files. Run independent commands under real SSH permissions. Cluster auto discovers reachable idle compute nodes and uses SSH; if none is available, submit to Slurm/PBS. execution_path=submit or batch resources force scheduler submission. Never execute workloads on the login endpoint. SSH workloads default to background=true and return a durable task_id; monitor via workspace_task_status/logs and workspace_tasks. background=false waits for output. direct is only for explicitly configured standalone servers. timeout_sec budgets SSH operations, not the lifetime of detached tasks. No automatic replay after an uncertain launch.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Optional explicit compute hostname, verified against fresh scheduler inventory and allowed partitions; omitted means automatic discovery."},"execution_path":{"type":["string","null"],"enum":["auto","ssh","submit","cluster","compute-node","compute_node","direct","submit-only","read-only","read_only",null],"default":"auto","description":"Usually omit. Transport hint: auto chooses compute SSH then scheduler; ssh requires compute SSH in cluster mode; submit forces the scheduler. force selects the execution mode. Legacy cluster/compute-node/direct path hints are normalized without allowing login-node workloads."},"background":{"type":"boolean","default":true},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"],"default":"cluster"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
+        tool("workspace_run", "For file/image transfer use workspace_read_file/download_file/write_file; do not run base64 to move files. Run independent commands under real SSH permissions. Cluster ALWAYS connects local -> registered login -> compute. NEVER run local SSH directly to compute nodes. Auto measures actual host availability (at least 3 idle CPU equivalents and more than 20% available RAM), including allocated nodes; if none qualifies, submit to Slurm/PBS. execution_path=submit or batch resources force scheduler submission. Never execute workloads on the login endpoint. SSH workloads default to background=true and return a durable task_id; monitor via workspace_task_status/logs and workspace_tasks. background=false waits for output. direct is only for explicitly configured standalone servers. timeout_sec budgets SSH operations, not the lifetime of detached tasks. No automatic replay after an uncertain launch.", serde_json::json!({"workspace_id":{"type":"string"},"command":{"type":"string"},"working_dir":{"type":"string"},"compute_node":{"type":"string","description":"Optional explicit compute hostname, verified against fresh scheduler inventory and allowed partitions; omitted means automatic discovery."},"execution_path":{"type":["string","null"],"enum":["auto","ssh","submit","cluster","compute-node","compute_node","direct","submit-only","read-only","read_only",null],"default":"auto","description":"Usually omit. Transport hint: auto measures compute availability through the login endpoint, then chooses SSH or scheduler; ssh requires compute SSH in cluster mode; submit forces the scheduler. force selects the execution mode. Legacy cluster/compute-node/direct path hints are normalized without allowing login-node workloads."},"background":{"type":"boolean","default":true},"batch":batch_schema(),"force":{"type":"string","enum":["direct","cluster","read-only"],"default":"cluster"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["command"]),
         tool("workspace_tasks", "List independent SSH task handles in this workspace without contacting a server. Returned states are last observations; query task_id for live state. Never deletes tasks or logs.", serde_json::json!({"workspace_id":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20}}), &[]),
         tool("workspace_task_status", "Read one SSH task's live state, exit code and actual hostname without waiting for other commands. Unknown is not success. Handles survive MCP restart.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_task_logs", "Read independent bounded stdout/stderr tails and live task state. Output is read on the recorded compute node; empty output is not completion evidence.", serde_json::json!({"workspace_id":{"type":"string"},"task_id":{"type":"string"},"max_bytes":{"type":"integer","minimum":1,"maximum":65536,"default":16384},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &["task_id"]),
         tool("workspace_submit", "Build the supplied command-file array mode: filter blank/comments, shuffle, balance at most 1000 task scripts, bound concurrency by maxnum and maxcpu/(ntasks*cpu), continue after individual failures, and report aggregate failure. Provide exactly one of local_path or commands_text. Every run gets a fresh directory; prior files are retained. Default generates only; submit=true launches. PBS flavor is reused per workspace or detected by read-only version/usage probes; an explicit pbs-pro/torque choice is remembered.", serde_json::json!({"workspace_id":{"type":"string"},"local_path":{"type":"string"},"commands_text":{"type":"string"},"batch":batch_schema(),"working_dir":{"type":"string"},"submit":{"type":"boolean","default":false},"timeout_sec":{"type":"integer","minimum":1,"default":120}}), &[]),
-        tool("workspace_cluster_info", "Read the cached scheduler/topology snapshot. refresh=true rediscovers topology, preserves user constraints, and replaces the cache. Missing resources stay unknown; cached data retains its original refreshed_at timestamp.", serde_json::json!({"workspace_id":{"type":"string"},"refresh":{"type":"boolean","default":false}}), &[]),
+        tool("workspace_cluster_info", "Read the cached scheduler/topology snapshot. Node state labels are not admission decisions: run measures actual CPU/memory through the login endpoint. refresh=true rediscovers topology, preserves user constraints, and replaces the cache. Missing resources stay unknown; cached data retains its original refreshed_at timestamp.", serde_json::json!({"workspace_id":{"type":"string"},"refresh":{"type":"boolean","default":false}}), &[]),
         tool("workspace_slurm_status", "Read scheduler job status (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
         tool("workspace_slurm_logs", "Read scheduler job logs (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
         tool("workspace_slurm_cancel", "Cancel a submitted scheduler job (Slurm/PBS).", serde_json::json!({"workspace_id": {"type": "string"}, "job_id": {"type": "string"}}), &["job_id"]),
@@ -1670,7 +1682,8 @@ mod tests {
         cluster.nodes[0].state="down".into();
         workspace_store::save_cluster_config(&config,&cluster,workspace.id).unwrap();
         let result=server.call_tool("workspace_diagnose_suggest",args.as_object().unwrap()).await.unwrap();
-        assert_eq!(result["partition_limits"]["nodes_available"],0);
+        assert!(result["partition_limits"]["nodes_available"].is_null());
+        assert_eq!(result["partition_limits"]["nodes_scheduler_idle"],0);
         assert_eq!(result["partition_limits"]["nodes_discovered"],1);
         drop(server);std::fs::remove_dir_all(root).unwrap();
     }

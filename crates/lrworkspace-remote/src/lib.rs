@@ -28,6 +28,7 @@
 pub mod b64;
 pub mod batch;
 pub mod compute_ssh;
+pub mod compute_resources;
 mod cluster;
 mod executor;
 mod file_transfer;

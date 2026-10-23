@@ -1,15 +1,21 @@
-# Cluster 执行与独立任务（0.6.0）
+# Cluster 执行与独立任务（0.6.6）
 
 `cluster` 在集群计算节点运行任务；登录节点只负责轻量查询、文件访问、中转和提交。`direct` 仅用于已确认的单服务器。所有 workload 默认 cluster，包括旧 `direct_compute` 注册。单服务器需显式选择 direct，未确认角色的端点仍拒绝 workload。
 
 | 请求 | 实际路径 |
 |---|---|
-| `run --force cluster` | 重新发现 Slurm/PBS 空闲节点，探测第二跳 SSH，选择可达节点运行；没有合适节点时提交调度器 |
+| `run --force cluster` | 重新发现 Slurm/PBS 节点，经登录节点测量实际资源，选择符合门槛的计算节点；没有合适节点时提交调度器 |
 | `run --force cluster --execution-path submit` | 登录节点提交 Slurm/PBS，任务在分配的计算节点运行 |
 | `run --force cluster --compute-node compute01` | 验证指定节点属于本次清单后，经登录节点 SSH 运行，不自动重提 |
 | `run --force direct` | 已确认的单服务器执行 |
 
-自动选择依据本次调度器发现结果，只选择 `idle/free` 节点，遵守已保存的允许队列限制，排除未知、占用、离线和登录端点。多个请求分散选择候选节点；最多探测四个节点。探测只核对主机与工作目录，不运行用户 workload。第二跳在执行前对比实际主机名，别名回到登录节点也会拒绝。
+集群连接链路始终是 **本机 → 已注册登录节点 → 计算节点**。`compute_node` 是从登录节点访问的目标；agent 不应在本机直接 SSH 该节点，也不能通过重注册为单服务器绕过此链路。返回的 `connection_chain` 显示实际两跳端点。
+
+自动选择依据新鲜调度器清单和计算节点上的实际资源测量，不再以 `idle/free` 作为唯一门槛。默认要求两项同时满足：实际空闲 CPU 能力折算至少 3 核；实际可用内存严格超过总内存的 20%。按用户要求，`alloc/mixed` 节点只要实际资源足够也可进入，不把调度器已预留的核数直接当成实际 CPU 占用。
+
+CPU 通过计算节点 `/proc/stat` 两次相隔 200 ms 的观测计算，空闲能力包含 idle/iowait；这是主机实际空闲能力折算，不是未分配配额。内存优先读取 `/proc/meminfo` 的 `MemAvailable`，旧内核缺少该字段时保守使用 `MemFree`，返回数据中标明口径。未知、无效或低于门槛的测量不算可用。指定节点同样需要符合资源门槛；已启动任务的状态/日志查询不受该门槛影响。
+
+仍遵守允许队列限制，排除 down/offline/drain/maintenance/reserved 和登录端点；同时请求分散候选节点，最多探测 16 个并受操作预算约束。固定探测只读取身份、工作目录和资源，不运行用户 workload。第二跳核对主机身份，别名回到登录节点也会拒绝。返回 `compute_selection.selected_resources` 和失败原因；这些是当次快照，不预留 CPU/内存，不保证后续负载不变。
 
 自动选择无需每次由用户提供计算节点名称。可用 `execution_path=ssh` / `--execution-path ssh` 要求必须 SSH，找不到节点就报错。非空 `batch` / CLI batch 资源参数强制调度提交；SSH 与 batch 资源不能混用。`workspace_submit` / `rw submit` 始终保留原有 Slurm、PBS Pro/OpenPBS、Torque 命令数组模式。
 
@@ -48,3 +54,7 @@ CLI 默认保持前台输出，`--background` 启用后台任务；MCP 可设 `b
 节点配置继续使用 CLI `--node-mode submit-only` / MCP `submit_only` 表示集群登录端点；这是保留的存储名称，不代表任务必须仅用调度器。单服务器使用 `single-server` / `single_server`，兼容旧 `direct-compute` / `direct_compute`。
 
 0.6.3 起，显式节点不能跳过新鲜节点清单与允许分区校验；目标实际主机名不匹配时拒绝执行。节点清单缺失或名字不明确时使用 submit，不把其它可 SSH 主机当成计算节点。既有任务只读监控继续沿用原节点记录。
+
+0.6.5 支持调度器节点名与系统主机名不同的 DNS 别名。登录节点对清单中的目标做实时 `getent ahosts` 查询；若短主机名不直接相同，实际主机名必须匹配该查询的规范名称，且 SSH 服务端连接地址必须出现在同一查询中。缺少任一依据仍拒绝执行；不会仅凭 SSH 可连接、客户端别名或目标自报名称放行。登录节点拒绝规则和 OpenSSH 主机密钥校验继续生效，合法别名不需要用户关闭校验或在源码添加节点白名单。
+
+自动选择失败会报告本次发现的节点数、候选计算节点数与实际资源测量和每个候选的探测失败原因；回退提交失败时保留这些原因，不能把身份不匹配误报成“节点全满”。`workspace_discover` 返回运行进程的 `server_version`。升级后应核对该字段，而非仅检查磁盘上的安装包；旧版本进程和客户端恢复的旧配置可能仍然存在。

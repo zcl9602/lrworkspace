@@ -190,10 +190,10 @@ enum Commands {
             clap::builder::PossibleValue::new("read-only"), clap::builder::PossibleValue::new("compute-node").hide(true),
         ]))]
         force: Option<String>,
-        /// Optional compute hostname; omitted selects an idle node automatically.
+        /// Optional compute hostname; omitted selects by measured spare CPU/memory.
         #[arg(long)]
         compute_node: Option<String>,
-        /// Auto-select an idle compute node, require SSH, or explicitly submit.
+        /// Auto-select a compute node with spare resources, require SSH, or submit.
         #[arg(long, default_value="auto", value_parser=clap::builder::PossibleValuesParser::new([
             clap::builder::PossibleValue::new("auto"), clap::builder::PossibleValue::new("ssh"), clap::builder::PossibleValue::new("submit"),
             clap::builder::PossibleValue::new("direct").hide(true), clap::builder::PossibleValue::new("cluster").hide(true),
@@ -892,17 +892,24 @@ async fn run_guarded(
         if (compute_node.is_some() && execution_path=="submit") || (has_batch && execution_path=="ssh") {
             return Err(CoreError::Validation("SSH node selection conflicts with scheduler submission/resources".into()));
         }
-        let selected=if let Some(node)=compute_node {Some(lrworkspace_remote::compute_ssh::verify_compute_node(&app.executor,&app.config,workspace,node).await?)}
+        let mut selection=None;
+        let selected=if let Some(node)=compute_node {
+                let report=lrworkspace_remote::compute_ssh::verify_compute_node_detailed(&app.executor,&app.config,workspace,node).await?;
+                let node=report.node.clone();selection=Some(report);node
+            }
             else if !has_batch && execution_path!="submit" {
-                lrworkspace_remote::compute_ssh::choose_compute_node(&app.executor,&app.config,workspace).await?
+                let report=lrworkspace_remote::compute_ssh::choose_compute_node_detailed(&app.executor,&app.config,workspace).await?;
+                let node=report.node.clone();selection=Some(report);node
             } else {None};
         if selected.is_none() && execution_path=="ssh" {
-            return Err(CoreError::NotFound("No reachable idle compute node; workload was not started".into()));
+            return Err(CoreError::NotFound(format!("No reachable compute node met the measured CPU/memory thresholds; workload was not started; {}",selection.as_ref().map(|report|report.summary()).unwrap_or_default())));
         }
         if let Some(node)=selected {
-            if background {return lrworkspace_remote::tasks::start(&app.executor,&app.config,workspace,Some(&node),command,working_dir).await;}
-            let record=app.executor.execute_compute_ssh(workspace,&node,command,working_dir).await?;
-            return Ok(serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"result":record}));
+            let mut value=if background {lrworkspace_remote::tasks::start(&app.executor,&app.config,workspace,Some(&node),command,working_dir).await?}
+                else {let record=app.executor.execute_compute_ssh(workspace,&node,command,working_dir).await?;
+                    serde_json::json!({"mode":"cluster","execution_path":"ssh","compute_node":node,"connection_chain":[workspace.connection.host,node],"result":record})};
+            if let Some(report)=selection {value["compute_selection"]=serde_json::to_value(report)?;}
+            return Ok(value);
         }
         let cluster = match workspace_store::load_cluster_config(&app.config, workspace.id) {
             Ok(cluster) => cluster,
@@ -913,8 +920,10 @@ async fn run_guarded(
             }
         };
         let commands=[BatchCommand {source_line:1,command:command.into()}];
-        let result=submit_batch(app.executor.clone(),&app.config,workspace,&cluster,&commands,options,working_dir,true,&AgentKind::CliAgent).await?;
-        let mut result=serde_json::to_value(result)?;result["mode"]=serde_json::json!("cluster");result["execution_path"]=serde_json::json!("submit");Ok(result)
+        let result=submit_batch(app.executor.clone(),&app.config,workspace,&cluster,&commands,options,working_dir,true,&AgentKind::CliAgent).await
+            .map_err(|error|match &selection {Some(report)=>CoreError::Connection(format!("{}; scheduler fallback failed: {error}",report.summary())),None=>error})?;
+        let mut result=serde_json::to_value(result)?;result["mode"]=serde_json::json!("cluster");result["execution_path"]=serde_json::json!("submit");
+        if let Some(report)=selection {result["compute_selection"]=serde_json::to_value(report)?;} Ok(result)
     } else {
         if background {return lrworkspace_remote::tasks::start(&app.executor,&app.config,workspace,None,command,working_dir).await;}
         let record = app
