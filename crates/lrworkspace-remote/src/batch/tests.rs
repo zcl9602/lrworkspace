@@ -94,6 +94,13 @@ fn pbs_dialects_preserve_total_tasks_threads_and_throttle() {
     assert_eq!(PbsFlavor::detect("pbs_version = 23.06.06"),Some(PbsFlavor::PbsPro));
     assert_eq!(PbsFlavor::detect("TORQUE version 6.1"),Some(PbsFlavor::Torque));
     assert!(PbsFlavor::detect("unknown build").is_none());
+    assert_eq!(PbsFlavor::detect("Version: 6.1.3\nCommit: fixture"),Some(PbsFlavor::Torque));
+    assert_eq!(PbsFlavor::detect("usage: qsub [-j join] [-J range] [script]"),Some(PbsFlavor::PbsPro));
+    assert_eq!(PbsFlavor::detect("usage: qsub [-j join] [-t range] [script]"),Some(PbsFlavor::Torque));
+    for ambiguous in ["pbs_version = 6.1.3", "usage: qsub [-j join] [script]",
+        "usage: qsub [-J range] [-t range]", "OpenPBS and TORQUE", "pbs_version = 23.06\nVersion: 6.1.3"] {
+        assert!(PbsFlavor::detect(ambiguous).is_none(),"{ambiguous}");
+    }
     assert_eq!(pbs_walltime("1-02").unwrap(),"26:00:00");
     assert_eq!(pbs_walltime("1-02:30").unwrap(),"26:30:00");
     assert_eq!(pbs_walltime("150").unwrap(),"02:30:00");

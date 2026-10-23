@@ -67,8 +67,24 @@ fn main() {
                 else {println!("default* 1 1-00:00:00 1:00:00 compute01");}
             }
         }
-        "sbatch"|"qsub"=>{
-            if args.iter().any(|arg|arg=="--version") {println!("pbs_version = 23.06.06");return;}
+        "qstat"|"sbatch"|"qsub"=>{
+            if program=="qstat" || args.iter().any(|arg|arg=="--version"||arg=="--help") {
+                use std::io::Write;
+                if let Some(path)=std::env::var_os("LRW_TEST_PBS_PROBE_LOG") {
+                    writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap(),"{program} {}",args.join(" ")).unwrap();
+                }
+                let mode=std::env::var("LRW_TEST_PBS_VERSION").unwrap_or_else(|_|"openpbs".into());
+                match (mode.as_str(),program.as_str(),args.first().map(String::as_str)) {
+                    ("openpbs",_,_)=>println!("pbs_version = 23.06.06"),
+                    ("torque-bare",_,Some("--version"))=>eprintln!("Version: 6.1.3\nCommit: fixture"),
+                    ("fallback-torque","qstat",Some("--version"))=>eprintln!("Version: 6.1.3\nCommit: fixture"),
+                    ("help-pro","qsub",Some("--help"))=>{eprintln!("usage: qsub [-j join] [-J range] [-l resource_list] [script]");std::process::exit(2);},
+                    ("help-torque","qsub",Some("--help"))=>{eprintln!("usage: qsub [-j join] [-t range] [-l resource_list] [script]");std::process::exit(2);},
+                    ("server-pro","qstat",Some("-Bf"))=>println!("Server: fixture\n    pbs_version = 23.06.06"),
+                    _=>{eprintln!("site wrapper: version unavailable");std::process::exit(2);},
+                }
+                return;
+            }
             let log=std::env::var_os("LRW_TEST_SUBMIT_LOG").expect("test log");
             use std::io::Write;
             let mut file=std::fs::OpenOptions::new().create(true).append(true).open(log).unwrap();

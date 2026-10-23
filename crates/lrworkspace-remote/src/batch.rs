@@ -31,9 +31,29 @@ impl PbsFlavor {
     }
     pub fn detect(version: &str) -> Option<Self> {
         let value=version.to_ascii_lowercase();
-        if value.contains("torque") { Some(Self::Torque) }
-        else if value.contains("openpbs") || value.contains("pbspro") || value.contains("pbs professional") || value.contains("pbs_version") { Some(Self::PbsPro) }
-        else { None }
+        // Torque's --version commonly prints only "Version: ..." on stderr.
+        let torque=value.contains("torque") || value.lines().any(|line|
+            line.trim().strip_prefix("version:").is_some_and(|number|number.trim().starts_with(|c:char|c.is_ascii_digit())));
+        // An old numeric pbs_version by itself is shared by multiple PBS
+        // families; recent PBS Pro/OpenPBS releases use 10+ release numbers.
+        let modern_pbs=value.lines().any(|line|line.trim().strip_prefix("pbs_version")
+            .and_then(|tail|tail.trim().strip_prefix('='))
+            .and_then(|number|number.trim().split('.').next()?.parse::<u32>().ok()).is_some_and(|major|major>=10));
+        let pro=value.contains("openpbs") || value.contains("pbspro") || value.contains("pbs professional") || modern_pbs;
+        match (pro,torque) {
+            (true,false)=>Some(Self::PbsPro),
+            (false,true)=>Some(Self::Torque),
+            (false,false)=>{
+                // Querying usage is safe and distinguishes array syntax even
+                // when a site's client wrapper omits its version identifier.
+                if !value.contains("usage:") || !value.contains("qsub") {return None;}
+                let flag=|name:&str|regex::Regex::new(&format!(r"(?:^|[\s\[|])-{}(?:[\s\]>]|$)",name)).expect("fixed option regex").is_match(version);
+                match (flag("J"),flag("t")) {
+                    (true,false)=>Some(Self::PbsPro), (false,true)=>Some(Self::Torque), _=>None,
+                }
+            }
+            _=>None,
+        }
     }
 }
 

@@ -194,7 +194,12 @@ enum Commands {
         #[arg(long)]
         compute_node: Option<String>,
         /// Auto-select an idle compute node, require SSH, or explicitly submit.
-        #[arg(long, default_value="auto", value_parser=["auto","ssh","submit"])]
+        #[arg(long, default_value="auto", value_parser=clap::builder::PossibleValuesParser::new([
+            clap::builder::PossibleValue::new("auto"), clap::builder::PossibleValue::new("ssh"), clap::builder::PossibleValue::new("submit"),
+            clap::builder::PossibleValue::new("direct").hide(true), clap::builder::PossibleValue::new("cluster").hide(true),
+            clap::builder::PossibleValue::new("compute-node").hide(true), clap::builder::PossibleValue::new("compute_node").hide(true),
+            clap::builder::PossibleValue::new("submit-only").hide(true), clap::builder::PossibleValue::new("read-only").hide(true),
+        ]))]
         execution_path: String,
         /// Start an independent task and return its task ID immediately.
         #[arg(long)]
@@ -875,15 +880,13 @@ async fn run_guarded(
     background: bool,
 ) -> CoreResult<serde_json::Value> {
     let route = resolve_execution_route(workspace.node_execution_mode, force)?;
+    let execution_path=lrworkspace_remote::normalize_execution_path(route,execution_path)?;
     if route == ExecutionRoute::ReadOnly {
         if classify_command_risk(command) != RiskLevel::ReadOnly {
             return Err(CoreError::PermissionDenied("Read-only execution requires an allowlisted command".into()));
         }
         let record = app.executor.execute_read_only(workspace, command, working_dir, &Default::default()).await?;
         return Ok(serde_json::json!({"mode":"read-only", "result":record}));
-    }
-    if route!=ExecutionRoute::Cluster && execution_path!="auto" {
-        return Err(CoreError::Validation("--execution-path applies only to cluster mode".into()));
     }
     if route == ExecutionRoute::Cluster {
         if (compute_node.is_some() && execution_path=="submit") || (has_batch && execution_path=="ssh") {

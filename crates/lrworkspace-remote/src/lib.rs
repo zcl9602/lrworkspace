@@ -49,5 +49,5 @@ pub use indexer::ProjectIndexerImpl;
 pub use openssh::{ensure_openssh_client, openssh_client_available};
 pub use ssh_config::SshConfig;
 pub use task_router::{
-    resolve_execution_route, ExecutionRoute,
+    resolve_execution_route, normalize_execution_path, ExecutionRoute,
 };

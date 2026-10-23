@@ -11,7 +11,9 @@
 
 自动选择依据本次调度器发现结果，只选择 `idle/free` 节点，遵守已保存的允许队列限制，排除未知、占用、离线和登录端点。多个请求分散选择候选节点；最多探测四个节点。探测只核对主机与工作目录，不运行用户 workload。第二跳在执行前对比实际主机名，别名回到登录节点也会拒绝。
 
-自动选择无需每次由用户提供计算节点名称。可用 `execution_path=ssh` / `--execution-path ssh` 要求必须 SSH，找不到节点就报错。显式 `batch` / CLI batch 资源参数强制调度提交；SSH 与 batch 资源不能混用。`workspace_submit` / `rw submit` 始终保留原有 Slurm、PBS Pro/OpenPBS、Torque 命令数组模式。
+自动选择无需每次由用户提供计算节点名称。可用 `execution_path=ssh` / `--execution-path ssh` 要求必须 SSH，找不到节点就报错。非空 `batch` / CLI batch 资源参数强制调度提交；SSH 与 batch 资源不能混用。`workspace_submit` / `rw submit` 始终保留原有 Slurm、PBS Pro/OpenPBS、Torque 命令数组模式。
+
+0.6.4 起，MCP 中省略 `execution_path`、设为 null，或省略/清空 `batch` 均保留默认自动路径，不会因为空资源对象意外强制 PBS 提交。`force` 决定模式，`execution_path` 仅选择传输路径；通常两者都省略即可。兼容旧路径提示 `cluster` → auto、`compute-node` → ssh、`submit-only` → submit；`execution_path=direct` 在 cluster 模式只能进入已验证计算节点 SSH，不能绕过登录节点限制。单服务器仍必须明确 `force=direct` 且已有单服务器确认；其 `execution_path=ssh/direct` 均可用。只读模式的 SSH 仍只允许白名单命令。
 
 SSH 使用登录账户已有的非交互认证，不转发本机 agent、不跳过主机密钥验证、不自动输入第二跳密码。它不申请调度器配额；要求资源分配的站点应使用 `execution_path=submit`。计算节点须能访问同一 work 路径，并提供 bash、hostname、realpath。后台任务另需 Linux setsid、nohup、tail 和 base64。
 

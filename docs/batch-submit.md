@@ -20,7 +20,7 @@ bash scripts/complex_workflow.sh
 rw submit --workspace research --in commands.sh --outdir JOBS --cpu 1 --maxnum 500
 # 生成新 run 并提交
 rw submit --workspace research --in commands.sh --outdir JOBS --cpu 1 --maxnum 500 --submit
-# PBS 队列/方言（不能识别版本时需要显式选择）
+# PBS 队列/方言（自动探测仍无法识别时，指定一次后记住）
 rw submit --workspace research --in commands.sh --outdir JOBS --queue cpu --pbs-flavor pbs-pro --submit
 rw submit --workspace research --in commands.sh --outdir JOBS --queue cpu --pbs-flavor torque --submit
 # 单命令也走同一模式
@@ -39,7 +39,7 @@ rw run --workspace research --force cluster --cpu 4 --maxcpu 80 -- bash scripts/
 | jobname | job；Slurm 最多 64 个 ASCII 字符，PBS 为兼容起见最多 15 个且字母开头 |
 | time / mem | 默认不写指令；显式提供时才申请 |
 | shuffle-seed | 可选，用于复现打乱顺序；实际值写进 plan.json |
-| pbs-flavor | 自动识别，或 pbs-pro / torque |
+| pbs-flavor | 自动识别，或 pbs-pro / torque；按工作区记住，显式参数可覆盖 |
 | submit | 默认只生成，显式 --submit 才提交 |
 | timeout-secs | 默认 120 秒，控制生成/上传/提交请求；与调度器作业运行时间不同 |
 
@@ -50,6 +50,8 @@ array_parallel = min(array_tasks, maxnum, floor(maxcpu / cpu_per_array_task))
 ```
 
 maxcpu 不足以运行一个元素时直接拒绝。命令尽量均匀分到各组，数量之差至多 1。maxcpu/maxnum 只约束本批次，不是跨批次的全局资源锁。集群限制不是申请量，不会自动把可用上限写成内存或时间请求。
+
+PBS 类型按显式参数、当前工作区已保存的选择、只读探测依次解析。探测依次使用 `qsub --version`、`qstat --version`、`qsub --help`、`qstat -Bf`，兼容 Torque 写到 stderr 的 `Version: …` 以及 `-J`/`-t` 数组用法。探测期间不提交测试任务，不在错误后换类型重提真实作业。信息仍不足或互相冲突时停止，不能猜测成功；此时显式指定一次 `batch.pbs_flavor`（CLI `--pbs-flavor`）。选择保存在本机独立 scheduler 元数据中，刷新节点清单不会丢失；连接主机、账户、端口或跳板路径改变后不复用旧选择。站点原地更换 PBS 实现时可用显式参数覆盖。无法保存选择只返回警告，不隐藏已提交的 job ID。
 
 ## MCP
 
