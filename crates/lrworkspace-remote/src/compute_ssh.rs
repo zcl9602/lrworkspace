@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use lrworkspace_core::{CoreError, CoreResult, safety::{normalize_remote_absolute, shell_quote}, types::*};
 use crate::{ExecutionRoute, RemoteExecutorImpl};
 use lrworkspace_core::{config::LrWorkspaceConfig, traits::ClusterDetector, workspace_store};
+use crate::compute_resources::{ResourceSnapshot,RESOURCE_PROBE};
 
 async fn fresh_inventory(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace) -> CoreResult<ClusterConfig> {
@@ -19,9 +20,23 @@ async fn fresh_inventory(executor: &RemoteExecutorImpl, config: &LrWorkspaceConf
 /// Always return the inventory hostname, never an unverified caller-supplied alias.
 pub async fn verify_compute_node(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace, requested: &str) -> CoreResult<String> {
+    Ok(verify_compute_node_detailed(executor,config,workspace,requested).await?.node.expect("verified target"))
+}
+
+pub async fn verify_compute_node_detailed(executor:&RemoteExecutorImpl,config:&LrWorkspaceConfig,
+    workspace:&Workspace,requested:&str)->CoreResult<ComputeSelection> {
     validate_compute_node(ExecutionRoute::Cluster, Some(requested), false)?;
     let cluster = fresh_inventory(executor, config, workspace).await?;
-    resolve_inventory_node(workspace, &cluster, requested)
+    let node=resolve_inventory_node(workspace,&cluster,requested)?;
+    let resources=inspect_resources(executor,workspace,&node).await?;
+    if !resources.admitted() {return Err(CoreError::PermissionDenied(format!("Compute target {node} lacks the required actual spare resources: {}; workload was not started",resources.summary())));}
+    Ok(ComputeSelection{node:Some(node),inventory_nodes:cluster.nodes.len(),candidate_nodes:1,selected_resources:Some(resources),..Default::default()})
+}
+
+async fn inspect_resources(executor:&RemoteExecutorImpl,workspace:&Workspace,node:&str)->CoreResult<ResourceSnapshot> {
+    let record=executor.execute_compute_ssh(workspace,node,RESOURCE_PROBE,None).await?;
+    if record.exit_code!=Some(0) {return Err(CoreError::Connection(format!("compute resource measurement unavailable (CPU/RAM unknown), exit {:?}: {}",record.exit_code,record.stderr.chars().take(1024).collect::<String>().trim())));}
+    ResourceSnapshot::parse(&record.stdout)
 }
 
 fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, requested: &str) -> CoreResult<String> {
@@ -39,6 +54,7 @@ fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, reques
     }
     let node = candidates.iter().find(|node| partition_allowed(cluster, node))
         .ok_or_else(|| CoreError::PermissionDenied("Compute node is outside the configured allowed partitions".into()))?;
+    if !operational(node) {return Err(CoreError::PermissionDenied("Compute node is offline, drained, reserved or under maintenance".into()));}
     validate_compute_node(ExecutionRoute::Cluster, Some(&node.hostname), false)?;
     if node.hostname.eq_ignore_ascii_case(&workspace.connection.host) {
         return Err(CoreError::PermissionDenied("Compute target is the login endpoint".into()));
@@ -46,7 +62,7 @@ fn resolve_inventory_node(workspace: &Workspace, cluster: &ClusterConfig, reques
     Ok(node.hostname.clone())
 }
 
-/// Probe fresh scheduler-advertised idle nodes before sending any workload.
+/// Measure fresh scheduler-listed compute candidates before sending any workload.
 /// A failed probe is safe to retry; an attempted workload is never replayed.
 pub async fn choose_compute_node(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace) -> CoreResult<Option<String>> {
@@ -57,32 +73,37 @@ pub async fn choose_compute_node(executor: &RemoteExecutorImpl, config: &LrWorks
 pub struct ComputeSelection {
     pub node:Option<String>,
     pub inventory_nodes:usize,
-    pub eligible_idle_nodes:usize,
+    pub candidate_nodes:usize,
+    pub selected_resources:Option<ResourceSnapshot>,
     pub probe_failures:Vec<String>,
 }
 
 impl ComputeSelection {
     pub fn summary(&self)->String {
-        format!("fresh inventory: {} nodes, {} eligible idle nodes; probe failures: {}",self.inventory_nodes,
-            self.eligible_idle_nodes,if self.probe_failures.is_empty(){"none".into()}else{self.probe_failures.join("; ")})
+        format!("fresh inventory: {} nodes, {} compute candidates; probe failures: {}",self.inventory_nodes,
+            self.candidate_nodes,if self.probe_failures.is_empty(){"none".into()}else{self.probe_failures.join("; ")})
     }
 }
 
 pub async fn choose_compute_node_detailed(executor: &RemoteExecutorImpl, config: &LrWorkspaceConfig,
     workspace: &Workspace) -> CoreResult<ComputeSelection> {
+    let started=std::time::Instant::now();
     let cluster = fresh_inventory(executor, config, workspace).await?;
     let mut nodes = eligible_compute_nodes(workspace, &cluster);
-    let mut selection=ComputeSelection{inventory_nodes:cluster.nodes.len(),eligible_idle_nodes:nodes.len(),..Default::default()};
+    let mut selection=ComputeSelection{inventory_nodes:cluster.nodes.len(),candidate_nodes:nodes.len(),..Default::default()};
     // Spread simultaneous requests over the eligible nodes instead of always choosing the first.
     if !nodes.is_empty() {
         let offset = (uuid::Uuid::new_v4().as_u128() % nodes.len() as u128) as usize;
         nodes.rotate_left(offset);
     }
-    let probe = executor.with_timeout(executor.timeout().min(Duration::from_secs(5)));
-    for node in nodes.into_iter().take(4) {
-        match probe.execute_compute_ssh(workspace, &node, ":", None).await {
-            Ok(record) if record.exit_code==Some(0)=>{selection.node=Some(node);return Ok(selection);},
-            Ok(record)=>selection.probe_failures.push(format!("{node}: exit {:?}: {}",record.exit_code,record.stderr.chars().take(1024).collect::<String>().trim())),
+    for node in nodes.into_iter().take(16) {
+        let Some(budget)=executor.timeout().checked_sub(started.elapsed()).filter(|budget|!budget.is_zero()) else {
+            selection.probe_failures.push("compute discovery operation budget exhausted".into());break;
+        };
+        let probe=executor.with_timeout(budget.min(Duration::from_secs(10)));
+        match inspect_resources(&probe,workspace,&node).await {
+            Ok(resources) if resources.admitted()=>{selection.node=Some(node);selection.selected_resources=Some(resources);return Ok(selection);},
+            Ok(resources)=>selection.probe_failures.push(format!("{node}: {}",resources.summary())),
             Err(error)=>selection.probe_failures.push(format!("{node}: {}",error.to_string().chars().take(1024).collect::<String>())),
         }
     }
@@ -98,12 +119,17 @@ fn partition_allowed(cluster: &ClusterConfig, node: &NodeInfo) -> bool {
 fn eligible_compute_nodes(workspace: &Workspace, cluster: &ClusterConfig) -> Vec<String> {
     if !matches!(cluster.scheduler, ClusterScheduler::Slurm|ClusterScheduler::Pbs) { return Vec::new(); }
     let mut nodes = cluster.nodes.iter().filter(|node| {
-        node.state == "idle" && node.cpu_cores > 0
+        operational(node)
         && !node.hostname.eq_ignore_ascii_case(&workspace.connection.host)
         && validate_compute_node(ExecutionRoute::Cluster,Some(&node.hostname),false).is_ok()
         && partition_allowed(cluster, node)
     }).map(|node|node.hostname.clone()).collect::<Vec<_>>();
     nodes.sort(); nodes.dedup(); nodes
+}
+
+fn operational(node:&NodeInfo)->bool {
+    !node.state.to_ascii_lowercase().split([',','+','*']).any(|state|
+        ["down","drain","offline","maint","resv","reserved"].iter().any(|denied|state.starts_with(denied)))
 }
 
 /// Validate syntax only. Explicit workload targets additionally need verify_compute_node.

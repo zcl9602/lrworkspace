@@ -197,7 +197,7 @@ printf 'LRW_TASK_STARTED:{id}\n'
     );
     let mut task = json!({"kind":"ssh-task","task_id":id,"workspace_id":workspace.id,
         "mode":if node.is_some(){"cluster"}else{"direct"},"execution_path":if node.is_some(){"ssh"}else{"direct"},
-        "compute_node":node,"remote_host":workspace.connection.host,"remote_user":workspace.connection.user,
+        "compute_node":node,"connection_chain":if let Some(node)=node {json!([workspace.connection.host,node])}else{json!([workspace.connection.host])},"remote_host":workspace.connection.host,"remote_user":workspace.connection.user,
         "remote_port":workspace.connection.port,"work_root":workspace.remote_work_dir,"relative_directory":relative,
         "status":"starting","created_at":chrono::Utc::now(),"working_dir":cwd,
         "stdout_path":format!("{directory}/stdout"),"stderr_path":format!("{directory}/stderr")});

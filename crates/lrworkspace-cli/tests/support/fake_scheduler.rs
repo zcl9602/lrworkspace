@@ -48,9 +48,28 @@ fn main() {
                 println!("192.0.2.11 DGRAM");
             } else {std::process::exit(2);}
         }
+        "awk"=>{
+            let input=args.last().map(String::as_str);
+            if matches!(input,Some("/proc/stat"|"/proc/meminfo")) {
+                if std::env::var_os("LRW_TEST_ON_COMPUTE").is_none() {eprintln!("fixture: resource probe must run on compute, through login");std::process::exit(2);}
+                if std::env::var_os("LRW_TEST_UNKNOWN_RESOURCES").is_some() {println!("unknown");return;}
+                if input==Some("/proc/stat") {
+                    let total=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64*8/10;
+                    let free=std::env::var("LRW_TEST_FREE_CPUS").ok().and_then(|value|value.parse::<u64>().ok()).unwrap_or(6);
+                    println!("{} {} 8",total,total*free/8);
+                } else {
+                    let percent=std::env::var("LRW_TEST_FREE_MEMORY_PERCENT").ok().and_then(|value|value.parse::<u64>().ok()).unwrap_or(80);
+                    println!("1000000 {} MemAvailable",10000*percent);
+                }
+                return;
+            }
+            let status=std::process::Command::new(std::env::var_os("LRW_TEST_REAL_AWK").expect("real fixture awk")).args(&args).status().unwrap();
+            std::process::exit(status.code().unwrap_or(1));
+        }
         "ssh"=>{
             if std::env::var_os("LRW_TEST_BLOCK_STDIN").is_some(){std::thread::sleep(std::time::Duration::from_secs(4));return;}
             if args.iter().any(|arg|arg=="-n") {
+                if std::env::var_os("LRW_TEST_ON_LOGIN").is_none(){eprintln!("fixture: local SSH to compute is forbidden");std::process::exit(254);}
                 use std::io::Write;
                 let mut log=std::fs::OpenOptions::new().create(true).append(true).open(std::env::var_os("LRW_TEST_SSH_LOG").unwrap()).unwrap();
                 writeln!(log,"{:?}",args).unwrap();
@@ -61,8 +80,11 @@ fn main() {
                     .env("SSH_CONNECTION",format!("192.0.2.1 12345 {peer} 22")).status().unwrap();
                 std::process::exit(status.code().unwrap_or(1));
             }
+            if !args.iter().any(|arg|arg=="only-a-local-fixture"||arg=="test@only-a-local-fixture") {
+                eprintln!("fixture: first-hop SSH must target the registered login, never a compute node");std::process::exit(254);
+            }
             let mut command=std::process::Command::new(std::env::var_os("LRW_TEST_BASH").expect("test bash"));
-            command.args(["--noprofile","--norc","-c","export PATH=\"$LRW_TEST_BIN_POSIX:$PATH\"; exec bash --noprofile --norc -s"]);
+            command.args(["--noprofile","--norc","-c","export PATH=\"$LRW_TEST_BIN_POSIX:$PATH\"; exec bash --noprofile --norc -s"]).env("LRW_TEST_ON_LOGIN","1");
             #[cfg(windows)] {use std::os::windows::process::CommandExt;command.creation_flags(0x08000000);}
             let status=command.status().unwrap();std::process::exit(status.code().unwrap_or(1));
         }
