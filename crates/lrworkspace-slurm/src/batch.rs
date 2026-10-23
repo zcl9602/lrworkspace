@@ -53,9 +53,7 @@ pub async fn submit_batch(executor:Arc<RemoteExecutorImpl>, config:&LrWorkspaceC
     let run_directory=target.rsplit_once('/').map(|(parent,_)|parent).ok_or_else(||CoreError::InvalidState("Invalid run root".into()))?;
     let parent=run_directory.rsplit_once('/').map(|(parent,_)|if parent.is_empty(){"/"}else{parent}).unwrap_or("/");
     let summary=BatchPlan::prepare(commands,&options,cluster.scheduler.clone(),run_relative,Path::new(run_directory))?;
-    let archive_path=std::env::temp_dir().join(format!("lrw-batch-{}.tar",uuid::Uuid::new_v4().simple()));
-    let file=std::fs::OpenOptions::new().write(true).create_new(true).open(&archive_path)?;
-    let archive=TemporaryArchive(archive_path);
+    let (file, archive)=TemporaryArchive::create()?;
     {
         let mut writer=std::io::BufWriter::new(file);
         BatchPlan::write_archive(commands,&summary,&prefix,&mut writer)?;
@@ -92,6 +90,16 @@ pub async fn submit_batch(executor:Arc<RemoteExecutorImpl>, config:&LrWorkspaceC
 }
 
 struct TemporaryArchive(std::path::PathBuf);
+impl TemporaryArchive {
+    fn create() -> CoreResult<(std::fs::File, Self)> {
+        let path=std::env::temp_dir().join(format!("lrw-batch-{}.tar",uuid::Uuid::new_v4().simple()));
+        let mut options=std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let file=options.open(&path)?;
+        Ok((file, Self(path)))
+    }
+}
 impl Drop for TemporaryArchive {fn drop(&mut self){let _=std::fs::remove_file(&self.0);}}
 
 fn parent_job_id(job_id:&str)->(String,Option<u32>) {
@@ -140,6 +148,14 @@ pub async fn tracked_batch_logs(executor:&RemoteExecutorImpl, config:&LrWorkspac
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn batch_archives_are_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let (file, archive)=TemporaryArchive::create().unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        drop(file);drop(archive);
+    }
     #[test]
     fn array_element_ids_resolve_to_the_parent_record() {
         assert_eq!(parent_job_id("123_7"),("123".into(),Some(7)));

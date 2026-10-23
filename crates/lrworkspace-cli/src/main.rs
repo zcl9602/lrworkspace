@@ -889,7 +889,7 @@ async fn run_guarded(
         if (compute_node.is_some() && execution_path=="submit") || (has_batch && execution_path=="ssh") {
             return Err(CoreError::Validation("SSH node selection conflicts with scheduler submission/resources".into()));
         }
-        let selected=if let Some(node)=compute_node {Some(node.to_string())}
+        let selected=if let Some(node)=compute_node {Some(lrworkspace_remote::compute_ssh::verify_compute_node(&app.executor,&app.config,workspace,node).await?)}
             else if !has_batch && execution_path!="submit" {
                 lrworkspace_remote::compute_ssh::choose_compute_node(&app.executor,&app.config,workspace).await?
             } else {None};

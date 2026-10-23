@@ -50,7 +50,7 @@ Host my-cluster
     HostName 192.0.2.20
     Port 2222
     User alice
-    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.6.2-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
+    ProxyCommand "C:/Users/alice/.local/share/lrworkspace/versions/0.6.3-windows-x86_64/rw.exe" proxy --proxy 127.0.0.1:1080 --host %h --port %p
 ```
 
 Mac 将程序位置替换为安装输出的绝对路径（没有 `.exe`）。代理地址/端口使用自己的设置；没有代理就省略 ProxyCommand。内置转发只支持无需用户名/密码的 SOCKS5；其它认证代理沿用合适的 ProxyCommand。代理只向 stdout 转发二进制，诊断走 stderr，握手默认 10 秒，可用 `--connect-timeout` 改。
