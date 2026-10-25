@@ -1,6 +1,6 @@
 # Local Remote Workspace（LRW）
 
-LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.6.6**。
+LRW 通过本机 CLI/MCP 和 SSH 访问远程工作区：查看文件、上传 agent 已完成的文件，以及执行命令或提交计算作业。当前版本为 **0.6.7**。
 
 ```text
 agent 自己的项目 → rw / lrworkspace-mcp → SSH → 远程 work / data 根
@@ -51,10 +51,11 @@ rw run --workspace research --force cluster --compute-node compute01 --timeout-s
 0.6.1 将小文件读取和完整下载都接入 rsync → SCP；两个后端都失败就报错。`workspace_read_file` 预览 UTF-8 文本或 PNG/JPEG/GIF/WebP 图片，图片以原生 MCP 图片内容返回，不把编码串作为文本输出。MCP 图片协议自身仍需要 base64 编码，这与 SSH 传输方式无关。其它二进制或大文件使用 `workspace_download_file`，不要通过 `workspace_run base64 ...` 下载。
 
 ```text
-rw download --workspace research --file results/plot.png --to <本机绝对路径>
+rw download --workspace research --file results/plot.png --to ./plot.png
+rw download --workspace research --file results/plot.png --to "~/Downloads/plot.png"
 ```
 
-MCP 下载参数：`relative_path`、`local_path`（绝对路径），可选 `root=work|data:N`、`transport=auto|rsync|scp`、`timeout_sec`。下载流式写入磁盘，返回路径、大小、实际后端和回退原因，不返回文件内容；本地父目录须存在，目标须为新文件，失败保留已有文件。read/write 保留显式 `transport=base64` 作为有界兼容选项。
+MCP 下载参数：`relative_path`、`local_path`，可选 `root=work|data:N`、`transport=auto|rsync|scp`、`timeout_sec`。从 0.6.7 起，下载的 `local_path` / CLI `--to` 支持绝对路径、相对路径和 `~/`（Windows 也接受 `~\`）。相对路径基于 LRW 进程当前目录，MCP 可通过 `workspace_discover.local_working_dir` 查看；它不一定是 agent 的项目目录。`~/` 基于本机用户主目录，沿用显式 `LRWORKSPACE_HOME` 覆盖。下载流式写入磁盘，返回最终绝对路径、大小、实际后端和回退原因，不返回文件内容；本地父目录须存在，目标须为新文件，失败保留已有文件。read/write 保留显式 `transport=base64` 作为有界兼容选项。
 
 ### 上传
 
