@@ -162,6 +162,7 @@ enum Commands {
         #[arg(long)] workspace: Option<String>,
         #[arg(long, default_value = "work")] root: String,
         #[arg(long)] file: PathBuf,
+        /// New local destination: absolute, relative to the current directory, or ~/ under the user home.
         #[arg(long)] to: PathBuf,
         #[arg(long, default_value="auto", value_parser=["auto", "rsync", "scp"])] transport: String,
     },
@@ -579,7 +580,7 @@ async fn run() -> CoreResult<i32> {
             let mut workspace = app.workspace(workspace.as_deref())?;
             workspace.file_threshold_bytes = workspace.file_threshold_bytes.min(app.config.file_threshold_bytes);
             let (bytes, receipt) = app.executor.read_remote_file_with_transport(&workspace, parse_root(&root)?, &file, TransferPreference::parse(&transport)?).await?;
-            let text = String::from_utf8(bytes).map_err(|_| CoreError::Validation("Binary file: use rw download --file <remote> --to <absolute-local-path>".into()))?;
+            let text = String::from_utf8(bytes).map_err(|_| CoreError::Validation("Binary file: use rw download --file <remote> --to <local-path>".into()))?;
             eprintln!("transport={}", receipt.transport.as_str());
             print!("{text}");
         }

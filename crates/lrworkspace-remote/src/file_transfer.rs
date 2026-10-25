@@ -462,8 +462,11 @@ fn decode_bounded_read(output: &str, limit: u64) -> CoreResult<Vec<u8>> {
 impl RemoteExecutorImpl {
     /// Download directly to a new file in the agent's project; never overwrite an existing path.
     pub async fn download_to_local_file(&self, workspace: &Workspace, root: RemoteRootKind, relative: &Path, local: &Path, preference: TransferPreference) -> CoreResult<DownloadReceipt> {
-        if !local.is_absolute() { return Err(CoreError::Validation("local_path must be absolute".into())); }
-        if std::fs::symlink_metadata(local).is_ok() { return Err(CoreError::Validation("Download destination already exists; choose a new local_path".into())); }
+        if local.as_os_str().is_empty() { return Err(CoreError::Validation("local_path must not be empty".into())); }
+        // Resolve once before any asynchronous work. Keep parent canonicalization
+        // and atomic no-clobber publication identical for every input spelling.
+        let local = std::path::absolute(lrworkspace_core::config::expand_user_path(local))?;
+        if std::fs::symlink_metadata(&local).is_ok() { return Err(CoreError::Validation("Download destination already exists; choose a new local_path".into())); }
         let parent = local.parent().ok_or_else(|| CoreError::Validation("Missing destination parent".into()))?;
         let parent = std::fs::canonicalize(parent)?;
         let destination = parent.join(local.file_name().ok_or_else(|| CoreError::Validation("Missing file name".into()))?);

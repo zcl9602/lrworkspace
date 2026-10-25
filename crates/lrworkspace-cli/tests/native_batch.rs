@@ -574,6 +574,37 @@ fn file_download_prefers_rsync_reports_scp_and_never_clobbers() {
 }
 
 #[test]
+fn file_download_resolves_relative_and_home_paths_without_overwrite() {
+    let Some(f)=Fixture::new(ClusterScheduler::Slurm) else{return};
+    let bytes=b"\x00\xffrelative download\n";
+    std::fs::write(f.root.join("work/source.bin"),bytes).unwrap();
+    let home=f.root.join("local home");
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    std::fs::create_dir(f.root.join("output")).unwrap();
+    #[allow(unused_mut)]
+    let mut cases=vec![("./output/relative ' 中文.bin",f.root.join("output/relative ' 中文.bin")),
+        ("output/../parent.bin",f.root.join("parent.bin")),
+        ("~/Downloads/home.bin",home.join("Downloads/home.bin"))];
+    #[cfg(windows)] cases.push((r"~\Downloads\windows.bin",home.join("Downloads/windows.bin")));
+    for (input,expected) in cases {
+        let mut command=f.command();
+        command.env("LRWORKSPACE_HOME",&home).args(["download","--workspace","fixture","--file","source.bin","--to",input]);
+        let receipt=success(command.output().unwrap());
+        assert_eq!(std::fs::read(&expected).unwrap(),bytes);
+        assert_eq!(Path::new(receipt["local_path"].as_str().unwrap()),expected.canonicalize().unwrap());
+        assert_eq!(receipt["transport"],"rsync");
+        std::fs::write(&expected,b"preserve existing").unwrap();
+        assert!(!command.output().unwrap().status.success());
+        assert_eq!(std::fs::read(&expected).unwrap(),b"preserve existing");
+    }
+    for input in ["", "missing-parent/new.bin", "~/missing-parent/new.bin"] {
+        assert!(!f.command().env("LRWORKSPACE_HOME",&home).args(["download","--workspace","fixture","--file","source.bin","--to",input]).output().unwrap().status.success());
+    }
+    assert!(!f.root.join("missing-parent").exists());
+    assert!(!home.join("missing-parent").exists());
+}
+
+#[test]
 #[ignore="requires matching MCP binary; local synthetic transports only"]
 fn mcp_file_images_and_downloads_use_binary_transport() {
     use std::io::Write; use std::process::Stdio;
@@ -581,13 +612,18 @@ fn mcp_file_images_and_downloads_use_binary_transport() {
     let bytes=b"\x89PNG\r\n\x1a\nsynthetic preview";
     std::fs::write(f.root.join("work/image.png"),bytes).unwrap();
     let exe=Path::new(env!("CARGO_BIN_EXE_rw")).parent().unwrap().join(if cfg!(windows){"lrworkspace-mcp.exe"}else{"lrworkspace-mcp"});
-    let mut child=f.command_for(&exe).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let home=f.root.join("local home");
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    let mut child=f.command_for(&exe).env("LRWORKSPACE_HOME",&home).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let mut input=child.stdin.take().unwrap();
     let destination=f.root.join("image-local.png");
     for request in [
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"file-test"}}}),
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"workspace_read_file","arguments":{"workspace_id":"fixture","relative_path":"image.png"}}}),
         serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workspace_download_file","arguments":{"workspace_id":"fixture","relative_path":"image.png","local_path":destination}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"workspace_download_file","arguments":{"workspace_id":"fixture","relative_path":"image.png","local_path":"~/Downloads/image.png"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"workspace_download_file","arguments":{"workspace_id":"fixture","relative_path":"image.png","local_path":"./relative-image.png"}}}),
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"workspace_discover","arguments":{}}}),
     ] {writeln!(input,"{request}").unwrap();}
     drop(input); let output=child.wait_with_output().unwrap(); assert!(output.status.success());
     let mut responses:Vec<serde_json::Value>=String::from_utf8(output.stdout).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();responses.sort_by_key(|v|v["id"].as_u64());
@@ -598,6 +634,13 @@ fn mcp_file_images_and_downloads_use_binary_transport() {
     let metadata:serde_json::Value=serde_json::from_str(preview[0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(metadata["transport"],"rsync"); assert!(metadata.get("content").is_none());
     assert_eq!(std::fs::read(destination).unwrap(),bytes);
+    for (index,expected) in [(3,home.join("Downloads/image.png")),(4,f.root.join("relative-image.png"))] {
+        let receipt:serde_json::Value=serde_json::from_str(responses[index]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(Path::new(receipt["local_path"].as_str().unwrap()),expected.canonicalize().unwrap());
+        assert_eq!(std::fs::read(expected).unwrap(),bytes);
+    }
+    let discovered:serde_json::Value=serde_json::from_str(responses[5]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(Path::new(discovered["local_working_dir"].as_str().unwrap()).canonicalize().unwrap(),f.root.canonicalize().unwrap());
 }
 
 #[test]
